@@ -253,6 +253,26 @@ function mount_encrypted() {
     fi
 }
 
+function setup_video_permissions() {
+    # Setup udev rule for video device permissions
+    # Required because rootless containers use UID remapping which breaks group-based access
+    local UDEV_RULE="/etc/udev/rules.d/99-video-container.rules"
+    local UDEV_CONTENT='KERNEL=="video[0-9]*", MODE="0666"'
+    
+    if [ ! -f "$UDEV_RULE" ]; then
+        echo "📹 Setting up video device permissions for container access..."
+        echo "$UDEV_CONTENT" | sudo tee "$UDEV_RULE" > /dev/null
+        sudo udevadm control --reload-rules
+        # Apply to existing devices
+        for vdev in /dev/video*; do
+            if [ -e "$vdev" ]; then
+                sudo chmod 666 "$vdev" 2>/dev/null || true
+            fi
+        done
+        echo "✅ Video device permissions configured"
+    fi
+}
+
 function verify_host_home_protection() {
     echo "🔍 Verifying container setup: $BOX_NAME"
     
@@ -279,38 +299,78 @@ function verify_host_home_protection() {
 function install_bridge() {
     echo "bridge: Installing internal permission bridge..."
     
+    # Install socat for audio socket proxying
+    distrobox enter "$BOX_NAME" -- sudo apt-get install -y socat pulseaudio-utils > /dev/null 2>&1 || true
+    
     cat << 'EOF' | distrobox enter "$BOX_NAME" -- sudo tee /usr/local/bin/run-as-dev > /dev/null
 #!/bin/bash
-# Bridge Script v113 (Final)
+# Bridge Script v121 (Audio Fix - Root Socket Proxy)
+# Uses socat to proxy pulse socket from host (owned by UID 1000) to a socket
+# that developer user (UID 1001) can access.
 set -e
 
-# 1. AUDIO & DISPLAY
-DBX_PULSE="${PULSE_SERVER:-unix:/run/user/1000/pulse/native}"
+DEVELOPER_HOME="/home/developer"
+HOST_UID="${HOST_UID:-1000}"
 
-# 2. GENERATE MACHINE ID
-if [ ! -f /var/lib/dbus/machine-id ]; then
-    mkdir -p /var/lib/dbus
-    dbus-uuidgen --ensure
+# 1. CREATE PULSE PROXY SOCKET
+# The host pulse socket is inside /run/user/1000 which is drwx------ 
+# and inaccessible to developer (UID 1001). We use socat running as root
+# to proxy the socket to a location developer can access.
+DEV_RUNTIME="/tmp/runtime-developer"
+PULSE_PROXY_DIR="$DEV_RUNTIME/pulse"
+
+sudo mkdir -p "$DEV_RUNTIME"
+sudo chown developer:developer "$DEV_RUNTIME"
+sudo chmod 700 "$DEV_RUNTIME"
+
+sudo mkdir -p "$PULSE_PROXY_DIR"
+sudo chown developer:developer "$PULSE_PROXY_DIR"
+
+HOST_PULSE_SOCKET="/run/host/run/user/$HOST_UID/pulse/native"
+PROXY_SOCKET="$PULSE_PROXY_DIR/native"
+
+if command -v socat &>/dev/null; then
+    # Kill any existing proxy
+    pkill -f "socat.*pulse/native" 2>/dev/null || true
+    
+    # Start socat as root (can access host socket), creates socket owned by developer
+    sudo rm -f "$PROXY_SOCKET"
+    sudo socat UNIX-LISTEN:"$PROXY_SOCKET",fork,user=developer,group=developer,mode=600 UNIX-CONNECT:"$HOST_PULSE_SOCKET" &
+    sleep 0.5
 fi
 
-# 3. SWITCH TO DEVELOPER
+# 2. COPY PULSE COOKIE FOR AUTHENTICATION  
+HOST_USER_NAME=$(getent passwd "$HOST_UID" 2>/dev/null | cut -d: -f1 || echo "")
+if [ -n "$HOST_USER_NAME" ] && [ -f "/run/host/home/$HOST_USER_NAME/.config/pulse/cookie" ]; then
+    sudo mkdir -p "$DEVELOPER_HOME/.config/pulse"
+    sudo cp "/run/host/home/$HOST_USER_NAME/.config/pulse/cookie" "$DEVELOPER_HOME/.config/pulse/cookie" 2>/dev/null || true
+    sudo chown -R developer:developer "$DEVELOPER_HOME/.config/pulse" 2>/dev/null || true
+    sudo chmod 600 "$DEVELOPER_HOME/.config/pulse/cookie" 2>/dev/null || true
+fi
+
+# 3. GENERATE MACHINE ID
+if [ ! -f /var/lib/dbus/machine-id ]; then
+    sudo mkdir -p /var/lib/dbus
+    sudo dbus-uuidgen --ensure
+fi
+
+# 4. SWITCH TO DEVELOPER
 sudo -E -u developer bash -c '
     export DISPLAY="$1"
-    export PULSE_SERVER="$2"
+    export HOME="/home/developer"
     
-    # --- CRITICAL FIXES ---
+    # --- AUDIO SETUP ---
+    export XDG_RUNTIME_DIR="/tmp/runtime-developer"
+    export PULSE_SERVER="unix:/tmp/runtime-developer/pulse/native"
+    export PULSE_COOKIE="$HOME/.config/pulse/cookie"
+    
+    # --- DISPLAY FIXES ---
     unset WAYLAND_DISPLAY
     unset XDG_SESSION_TYPE
-    export LIBGL_ALWAYS_SOFTWARE=1
+    export LIBGL_ALWAYS_SOFTWARE=0
     
-    # ISOLATE RUNTIME
-    export XDG_RUNTIME_DIR="/tmp/runtime-developer"
-    mkdir -p "$XDG_RUNTIME_DIR"
-    chmod 700 "$XDG_RUNTIME_DIR"
-    
-    # ISOLATE DATA DIRS (Prevent Host Leakage)
+    # ISOLATE DATA DIRS
     export XDG_DATA_DIRS="/usr/local/share:/usr/share"
-    export HOME="/home/developer"
     export XDG_DATA_HOME="$HOME/.local/share"
     export XDG_CONFIG_HOME="$HOME/.config"
     export XDG_CACHE_HOME="$HOME/.cache"
@@ -319,25 +379,22 @@ sudo -E -u developer bash -c '
     
     unset DBUS_SESSION_BUS_ADDRESS
 
-    # IMPORT KEYS
+    # IMPORT X11 KEYS
     export XAUTHORITY="$(mktemp /tmp/xauth_user.XXXXXX)"
     touch "$XAUTHORITY"
-    
     if [ -n "$XAUTH_SOURCE_FILE" ] && [ -f "$XAUTH_SOURCE_FILE" ]; then
         xauth -f "$XAUTHORITY" nmerge "$XAUTH_SOURCE_FILE" 2>/dev/null
     fi
 
     # ENVIRONMENT
     export PATH="/opt/isolated_wrappers:/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games:$PATH"
-    
-    # Load ASDF
+    export ASDF_DIR="$HOME/.asdf"
     if [ -f "$HOME/.asdf/asdf.sh" ]; then . "$HOME/.asdf/asdf.sh"; fi
-    
     export BROWSER=brave-browser
     export GTK_USE_PORTAL=0
     export NO_AT_BRIDGE=1
     
-    shift 3
+    shift 1
     
     CMD_NAME="$1"
     CMD_PATH="$(command -v "$CMD_NAME")"
@@ -352,11 +409,8 @@ sudo -E -u developer bash -c '
     fi
     shift 1
     
-    echo "[INTERNAL] Launching via dbus-run-session: $CMD_PATH $@"
-    
-    # EXECUTE WRAPPED
     exec dbus-run-session -- "$CMD_PATH" "$@"
-' -- "$DISPLAY" "$DBX_PULSE" "IGNORED" "$@"
+' -- "$DISPLAY" "$@"
 EOF
 
     distrobox enter "$BOX_NAME" -- sudo chmod +x /usr/local/bin/run-as-dev
@@ -479,8 +533,6 @@ elif [ "$ACTION" == "create" ]; then
     # Capture encryption status from function
     ENCRYPTION_ENABLED=$?
     
-    DEVICES=""; [ -e /dev/dri ] && DEVICES="$DEVICES --device /dev/dri"
-    
     if ! distrobox list | grep -q "$BOX_NAME"; then
         # --- CRITICAL FIX: MASK HOST HOME DIRECTORY TO PREVENT DATA LOSS ---
         # Distrobox by default mounts the host's home directory inside the container.
@@ -525,13 +577,52 @@ elif [ "$ACTION" == "create" ]; then
         # - Developer user has NO sudo group membership (can't sudo inside container)
         # - Host home is set to 700 (owner-only) - developer user can't access it
         # - This is safe: skyron can still access on host, only "others" are blocked
+        
+        # Build device list based on available hardware
+        DEVICES=""
+        
+        # GPU (required for hardware acceleration)
+        [ -e /dev/dri ] && DEVICES="$DEVICES --device /dev/dri"
+        
+        # Audio devices (required for video calls, sound)
+        # Mount the entire /dev/snd directory if it exists
+        [ -d /dev/snd ] && DEVICES="$DEVICES --device /dev/snd"
+        
+        # Webcam (enumerate available video devices)
+        # Check if any video devices exist before iterating
+        if ls /dev/video* 1>/dev/null 2>&1; then
+            for video_dev in /dev/video*; do
+                [ -e "$video_dev" ] && DEVICES="$DEVICES --device $video_dev"
+            done
+        fi
+        
+        # Audio passthrough - PulseAudio/PipeWire socket
+        # This allows audio input (microphone) and output (speakers) to work
+        AUDIO_MOUNTS=""
+        HOST_XDG_RUNTIME="/run/user/$(id -u $HOST_USER)"
+        
+        # PulseAudio socket
+        if [ -e "$HOST_XDG_RUNTIME/pulse/native" ]; then
+            AUDIO_MOUNTS="$AUDIO_MOUNTS --volume $HOST_XDG_RUNTIME/pulse:$HOST_XDG_RUNTIME/pulse:ro"
+        fi
+        
+        # PipeWire socket (modern systems)
+        if [ -e "$HOST_XDG_RUNTIME/pipewire-0" ]; then
+            AUDIO_MOUNTS="$AUDIO_MOUNTS --volume $HOST_XDG_RUNTIME/pipewire-0:$HOST_XDG_RUNTIME/pipewire-0:rw"
+        fi
+        
+        # SECURITY NOTE: We cannot use --security-opt=no-new-privileges:true because
+        # distrobox requires sudo inside the container for provisioning and package installation.
+        # Security is maintained through: capability dropping, namespace isolation, and host home masking.
+        #
+        # NOTE: Removed --unshare-devsys as it prevents access to audio/video devices
+        # Device access is controlled explicitly via --device flags instead
         distrobox create --name "$BOX_NAME" \
             --image "ubuntu:24.04" \
             --volume "$WORK_DIR/home:/home/$INTERNAL_USER" \
             --home "$WORK_DIR/host_mask" \
             --unshare-process \
-            --unshare-devsys \
-            --additional-flags "--ipc=host --privileged $DEVICES --volume /tmp/.X11-unix:/tmp/.X11-unix" \
+            --additional-flags "--ipc=private --shm-size=4g --cap-drop=ALL --cap-add=SYS_PTRACE --cap-add=SETUID --cap-add=SETGID $DEVICES $AUDIO_MOUNTS --volume /tmp/.X11-unix:/tmp/.X11-unix:ro" \
             --init --yes
         
         # PROTECT HOST HOME: Set to 700 so only owner (skyron) can access
@@ -555,16 +646,17 @@ elif [ "$ACTION" == "create" ]; then
 set -e
 export DEBIAN_FRONTEND=noninteractive
 
-# --- 1. APPARMOR NEUTRALIZATION ---
-echo ">>> Neutralizing AppArmor..."
-dpkg-divert --local --rename --add /usr/sbin/apparmor_parser 2>/dev/null || true
-if [ -L /sbin/apparmor_parser ] || [ -f /sbin/apparmor_parser ]; then
-    dpkg-divert --local --rename --add /sbin/apparmor_parser 2>/dev/null || true
+# --- 1. APPARMOR CONFIGURATION (Permissive Mode) ---
+# Instead of disabling AppArmor entirely, we configure it in complain mode
+# This logs violations without blocking, providing security visibility
+echo ">>> Configuring AppArmor in complain mode..."
+if command -v aa-complain >/dev/null 2>&1; then
+    # Set all profiles to complain mode (log but don't enforce)
+    aa-complain /etc/apparmor.d/* 2>/dev/null || true
+else
+    # If aa-complain not available, create a permissive wrapper that logs
+    echo "AppArmor tools not available, skipping profile configuration"
 fi
-echo '#!/bin/sh' > /usr/sbin/apparmor_parser
-echo 'exit 0' >> /usr/sbin/apparmor_parser
-chmod +x /usr/sbin/apparmor_parser
-ln -sf /usr/sbin/apparmor_parser /sbin/apparmor_parser 2>/dev/null || true
 
 echo ">>> Installing System & Compliance Packages..."
 apt-get update && apt-get install -y curl git zsh wget unzip build-essential sudo \
@@ -580,14 +672,14 @@ service unattended-upgrades start || true
 
 
 INTERNAL_USER="developer"
-groupadd -f docker
 
-# SECURITY: Create developer user WITHOUT sudo access
-# This prevents bypassing the tmpfs mask over host home
+# SECURITY: Create developer user WITHOUT sudo or docker access
+# - No sudo: prevents bypassing the tmpfs mask over host home
+# - No docker: docker group grants root-equivalent access (HSV-003)
 # For admin tasks, use: distrobox enter $BOX_NAME -- sudo <command>
 # (which uses the host user's sudo, not container sudo)
 if ! id "$INTERNAL_USER" &>/dev/null; then 
-    useradd -m -s /usr/bin/zsh -G audio,video,plugdev,docker "$INTERNAL_USER"
+    useradd -m -s /usr/bin/zsh -G audio,video,plugdev "$INTERNAL_USER"
 fi
 
 # --- FIX: FORCE ZSH DEFAULT ---
@@ -602,11 +694,12 @@ chown -R "$INTERNAL_USER:$INTERNAL_USER" "/home/$INTERNAL_USER/"* 2>/dev/null ||
 chown "$INTERNAL_USER:$INTERNAL_USER" "/home/$INTERNAL_USER" 2>/dev/null || true
 
 # XDG OPEN WRAPPER (will be configured by app setup script)
+# SECURITY: Using --disable-setuid-sandbox instead of --no-sandbox (CVE-CUSTOM-002)
 mkdir -p "/opt/isolated_wrappers"
 echo '#!/bin/bash' > "/opt/isolated_wrappers/xdg-open"
 echo 'echo "[WRAPPER] Opening URL: $1"' >> "/opt/isolated_wrappers/xdg-open"
 echo 'if command -v brave-browser >/dev/null 2>&1; then' >> "/opt/isolated_wrappers/xdg-open"
-echo '    exec brave-browser --no-sandbox "$1"' >> "/opt/isolated_wrappers/xdg-open"
+echo '    exec brave-browser --disable-setuid-sandbox "$1"' >> "/opt/isolated_wrappers/xdg-open"
 echo 'else' >> "/opt/isolated_wrappers/xdg-open"
 echo '    echo "No browser configured yet. Run setup-apps.sh to install applications."' >> "/opt/isolated_wrappers/xdg-open"
 echo 'fi' >> "/opt/isolated_wrappers/xdg-open"
@@ -674,7 +767,48 @@ timeout: 0:15:00
 lock:    True
 mode:    blank
 XS
+
+# --- 3. SSH KEY GENERATION FOR GIT ---
+echo ">>> Generating SSH key for Git..."
+mkdir -p "$HOME/.ssh"
+chmod 700 "$HOME/.ssh"
+SSH_KEY_FILE="$HOME/.ssh/id_ed25519_ENV_NAME"
+if [ ! -f "$SSH_KEY_FILE" ]; then
+    ssh-keygen -t ed25519 -C "developer@ENV_NAME" -f "$SSH_KEY_FILE" -N ""
+    echo "✅ SSH key generated: $SSH_KEY_FILE"
+    echo ""
+    echo "📋 Add this public key to your Git provider (GitHub/GitLab/etc.):"
+    cat "${SSH_KEY_FILE}.pub"
+    echo ""
+else
+    echo "SSH key already exists: $SSH_KEY_FILE"
+fi
+
+# Configure SSH to use this key for common Git hosts
+cat >> "$HOME/.ssh/config" << 'SSHCONFIG'
+Host github.com
+    HostName github.com
+    User git
+    IdentityFile ~/.ssh/id_ed25519_ENV_NAME
+    IdentitiesOnly yes
+
+Host gitlab.com
+    HostName gitlab.com
+    User git
+    IdentityFile ~/.ssh/id_ed25519_ENV_NAME
+    IdentitiesOnly yes
+
+Host bitbucket.org
+    HostName bitbucket.org
+    User git
+    IdentityFile ~/.ssh/id_ed25519_ENV_NAME
+    IdentitiesOnly yes
+SSHCONFIG
+chmod 600 "$HOME/.ssh/config"
 EOF
+
+    # Replace ENV_NAME placeholder with actual box name
+    sed -i "s/ENV_NAME/$BOX_NAME/g" "$USER_SCRIPT"
 
     cat "$USER_SCRIPT" | distrobox enter "$BOX_NAME" -- sudo tee /home/$INTERNAL_USER/user.sh > /dev/null
     distrobox enter "$BOX_NAME" -- sudo chown $INTERNAL_USER:$INTERNAL_USER /home/$INTERNAL_USER/user.sh
@@ -682,6 +816,7 @@ EOF
     distrobox enter "$BOX_NAME" -- sudo -u "$INTERNAL_USER" /bin/bash /home/$INTERNAL_USER/user.sh
 
     install_bridge
+    setup_video_permissions
     
     # Final verification
     echo ""

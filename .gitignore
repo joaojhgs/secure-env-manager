@@ -1,0 +1,24 @@
+# Binaries and installers
+*.deb
+*.rpm
+*.exe
+*.dmg
+*.pkg
+
+# Logs
+*.log
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak

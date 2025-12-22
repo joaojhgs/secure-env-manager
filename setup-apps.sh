@@ -48,36 +48,43 @@ function create_launchers() {
         cat <<SCRIPT > "/tmp/$BIN_NAME"
 #!/bin/bash
 
-# 1. PREPARE KEY
+# 1. PREPARE X11 KEY
 X_FILE="/tmp/.xauth_transfer_\${USER}"
 if command -v xauth >/dev/null; then
     xauth nlist \$DISPLAY | sed -e 's/^..../ffff/' > "\$X_FILE"
     chmod 644 "\$X_FILE"
 fi
 
-# 2. CALL BRIDGE
-CMD_STR="distrobox enter $BOX_NAME -- env XAUTH_SOURCE_FILE=\$X_FILE /usr/local/bin/run-as-dev $CMD \$@"
+# 2. CALL BRIDGE (pass HOST_UID for audio access)
+export HOST_UID=\$(id -u)
+CMD_STR="distrobox enter $BOX_NAME -- env HOST_UID=\$HOST_UID XAUTH_SOURCE_FILE=\$X_FILE /usr/local/bin/run-as-dev $CMD \$@"
 
-# Grant Socket Access
+# Grant Socket Access - SECURITY FIX (CVE-CUSTOM-003)
+# Use SI (Server Interpreted) authorization - only authorize current user
 if command -v xhost >/dev/null; then
-    xhost +local: >/dev/null 2>&1
+    xhost +SI:localuser:\$(whoami) >/dev/null 2>&1
 fi
 
+# Set ACL on X11 socket - SECURITY: DO NOT fall back to world-writable (HSV-002)
 if [ -n "\$DISPLAY" ]; then
     SOCKET_NUM=\${DISPLAY#*:} 
     SOCKET_PATH="/tmp/.X11-unix/X\${SOCKET_NUM%.*}"
     if command -v setfacl &> /dev/null && [ -e "\$SOCKET_PATH" ]; then
-        setfacl -m u:$(id -u):rw "\$SOCKET_PATH" 2>/dev/null || chmod o+w "\$SOCKET_PATH" 2>/dev/null
-    elif [ -e "\$SOCKET_PATH" ]; then
-        chmod o+w "\$SOCKET_PATH" 2>/dev/null
+        setfacl -m u:\$(id -u):rw "\$SOCKET_PATH" 2>/dev/null || echo "Warning: Could not set X11 socket ACL"
     fi
+    # REMOVED: chmod o+w fallback - this is a security risk (HSV-002)
 fi
 
 # 3. LAUNCH
+# SECURITY: Use secure log location instead of /tmp (MSV-001)
+LOG_DIR="\$HOME/.local/log"
+mkdir -p "\$LOG_DIR"
+chmod 700 "\$LOG_DIR"
+
 if [ -t 0 ]; then
     \$CMD_STR
 else
-    \$CMD_STR >> /tmp/${BIN_NAME}.log 2>&1
+    \$CMD_STR >> "\$LOG_DIR/${BIN_NAME}.log" 2>&1
 fi
 SCRIPT
         sudo mv "/tmp/$BIN_NAME" "/usr/local/bin/$BIN_NAME"
@@ -96,8 +103,10 @@ StartupNotify=true
 DESKTOP
     }
 
-    # FLAGS
-    FLAGS="--password-store=basic --no-sandbox --disable-dev-shm-usage --disable-gpu-sandbox --ozone-platform=x11 --verbose"
+    # FLAGS - SECURITY: Removed --no-sandbox and --disable-gpu-sandbox (CVE-CUSTOM-002)
+    # Using --disable-setuid-sandbox is safe since container doesn't have setuid anyway
+    # User-namespace sandbox remains active for protection
+    FLAGS="--password-store=basic --disable-setuid-sandbox --disable-dev-shm-usage --ozone-platform=x11 --verbose"
     
     # Only create launchers for installed apps
     if distrobox enter "$BOX_NAME" -- command -v code >/dev/null 2>&1; then
@@ -195,12 +204,13 @@ echo "$E_JSON" > "/etc/opt/chrome/policies/managed/extensions.json"
 chmod -R 755 "/etc/brave" "/etc/opt/chrome"
 
 # Update XDG OPEN WRAPPER to use Brave
+# SECURITY: Using --disable-setuid-sandbox instead of --no-sandbox (CVE-CUSTOM-002)
 if [ -f "/opt/isolated_wrappers/xdg-open" ]; then
     cat > "/opt/isolated_wrappers/xdg-open" << 'XDGEOF'
 #!/bin/bash
 echo "[WRAPPER] Opening URL: $1"
 if command -v brave-browser >/dev/null 2>&1; then
-    exec brave-browser --no-sandbox "$1"
+    exec brave-browser --disable-setuid-sandbox "$1"
 else
     echo "No browser available"
     exit 1
