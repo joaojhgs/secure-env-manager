@@ -198,7 +198,7 @@ fi
 # BRAVE POLICIES & EXTENSIONS
 echo ">>> Configuring Brave Policies..."
 mkdir -p "/etc/brave/policies/managed" "/etc/opt/chrome/policies/managed"
-E_JSON='{ "ExtensionInstallForcelist": [ "cjpalhdlnbpafiamejdnhcphjbkeiagm", "nngceckbapebfimnlniiiahkandclblb", "fmpjacodnojmnejpqbewdnoipchhanaa", "fmkadmapgofadopljbjfkapdkoienihi" ] }'
+E_JSON='{ "ExtensionInstallForcelist": [ "oldceeleldhonbafppcapldpdifcinji", "folnjigffmbjmcjgmbbfcpleeddaedal", "cimiefiiaegbelhefglklhhakcgmhkai", "gppongmhjkpfnbhagpmjfkannfbllamg" ] }'
 echo "$E_JSON" > "/etc/brave/policies/managed/extensions.json"
 echo "$E_JSON" > "/etc/opt/chrome/policies/managed/extensions.json"
 chmod -R 755 "/etc/brave" "/etc/opt/chrome"
@@ -230,16 +230,21 @@ distrobox enter "$BOX_NAME" -- sudo /bin/bash /tmp/root-apps.sh
 DRATA_DEB=$(find "$SCRIPT_DIR" -maxdepth 1 -name "Drata*.deb" | head -n 1)
 if [ -n "$DRATA_DEB" ]; then
     echo "📦 Found Drata Agent: $(basename "$DRATA_DEB")"
-    cat "$DRATA_DEB" | distrobox enter "$BOX_NAME" -- sudo tee /tmp/drata.deb > /dev/null
+    read -p "🔹 Do you want to install Drata Agent? (y/N): " INSTALL_DRATA < /dev/tty
+    if [[ "$INSTALL_DRATA" =~ ^[Yy]$ ]]; then
+        cat "$DRATA_DEB" | distrobox enter "$BOX_NAME" -- sudo tee /tmp/drata.deb > /dev/null
     # Drata's post-install script tries to load AppArmor profile which fails in containers
     # Use dpkg with --force-confdef to install, ignoring post-install script failures
     distrobox enter "$BOX_NAME" -- sudo dpkg -i --force-confdef /tmp/drata.deb 2>/dev/null || true
     distrobox enter "$BOX_NAME" -- sudo apt-get install -f -y 2>/dev/null || true
-    # Check if binary was installed despite post-install failure
-    if distrobox enter "$BOX_NAME" -- command -v drata-agent >/dev/null 2>&1; then
-        echo "✅ Drata Agent Installed (AppArmor profile skipped - normal in containers)."
+        # Check if binary was installed despite post-install failure
+        if distrobox enter "$BOX_NAME" -- command -v drata-agent >/dev/null 2>&1; then
+            echo "✅ Drata Agent Installed (AppArmor profile skipped - normal in containers)."
+        else
+            echo "⚠️  Drata Agent installation may have issues. Check manually."
+        fi
     else
-        echo "⚠️  Drata Agent installation may have issues. Check manually."
+        echo "⏭️  Skipping Drata Agent installation."
     fi
 else
     echo "⚠️  No Drata Agent .deb found in $SCRIPT_DIR. Skipping."

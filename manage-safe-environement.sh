@@ -446,15 +446,6 @@ elif [ "$ACTION" == "delete" ]; then
     
     echo "🧹 Cleaning up storage..."
     
-    # Restore host home permissions to default (755) if they were changed
-    if [ -d "$HOST_HOME" ]; then
-        CURRENT_PERMS=$(stat -c "%a" "$HOST_HOME" 2>/dev/null)
-        if [ "$CURRENT_PERMS" = "700" ]; then
-            echo "   Restoring host home permissions to 755..."
-            chmod 755 "$HOST_HOME"
-        fi
-    fi
-    
     # 1. Kill processes inside mount (Force -9)
     if [ -d "$WORK_DIR" ]; then
         sudo fuser -k -9 -m "$WORK_DIR" >/dev/null 2>&1 || true
@@ -529,9 +520,14 @@ elif [ "$ACTION" == "create" ]; then
     
     if [ ! -d "$WORK_DIR" ]; then sudo mkdir -p "$WORK_DIR"; fi
     DO_ENCRYPT=""
-    setup_encryption
-    # Capture encryption status from function
-    ENCRYPTION_ENABLED=$?
+    # Call setup_encryption and capture return value
+    # Return 0 = encryption enabled, Return 1 = no encryption
+    # Use subshell to prevent set -e from exiting on return 1
+    if setup_encryption; then
+        ENCRYPTION_ENABLED=0
+    else
+        ENCRYPTION_ENABLED=1
+    fi
     
     if ! distrobox list | grep -q "$BOX_NAME"; then
         # --- CRITICAL FIX: MASK HOST HOME DIRECTORY TO PREVENT DATA LOSS ---
