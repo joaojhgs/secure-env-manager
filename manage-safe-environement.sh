@@ -273,6 +273,181 @@ function setup_video_permissions() {
     fi
 }
 
+function setup_default_input_devices() {
+    echo "🎤 Setting up default input devices inside container..."
+    
+    # Install PulseAudio utilities, ALSA plugins for PulseAudio redirection, and tools
+    distrobox enter "$BOX_NAME" -- sudo apt-get install -y pulseaudio-utils alsa-utils libasound2-plugins > /dev/null 2>&1 || true
+    
+    # Create ALSA config to redirect all ALSA applications to PulseAudio
+    # This is CRITICAL for apps like PyAudio that use ALSA directly
+    echo "📝 Configuring ALSA to use PulseAudio backend..."
+    cat << 'ASLACONF' | distrobox enter "$BOX_NAME" -- sudo tee /etc/asound.conf > /dev/null
+# Redirect ALSA to PulseAudio
+pcm.!default {
+    type pulse
+    fallback "sysdefault"
+    hint {
+        show on
+        description "Default ALSA Output (PulseAudio Sound Server)"
+    }
+}
+
+ctl.!default {
+    type pulse
+    fallback "sysdefault"
+}
+
+# For applications that specifically request "pulse"
+pcm.pulse {
+    type pulse
+}
+
+ctl.pulse {
+    type pulse
+}
+ASLACONF
+    
+    # Also create user-level config for the developer user
+    cat << 'ASLACONF' | distrobox enter "$BOX_NAME" -- sudo tee /home/$INTERNAL_USER/.asoundrc > /dev/null
+# Redirect ALSA to PulseAudio (user config)
+pcm.!default {
+    type pulse
+    fallback "sysdefault"
+    hint {
+        show on
+        description "Default ALSA Output (PulseAudio Sound Server)"
+    }
+}
+
+ctl.!default {
+    type pulse
+    fallback "sysdefault"
+}
+
+pcm.pulse {
+    type pulse
+}
+
+ctl.pulse {
+    type pulse
+}
+ASLACONF
+    distrobox enter "$BOX_NAME" -- sudo chown $INTERNAL_USER:$INTERNAL_USER /home/$INTERNAL_USER/.asoundrc
+    
+    # Create a script to set default input devices at runtime
+    cat << 'EOF' | distrobox enter "$BOX_NAME" -- sudo tee /usr/local/bin/setup-default-inputs > /dev/null
+#!/bin/bash
+# Script to configure default input devices (microphone, webcam)
+# This runs during container startup or can be called manually
+
+set -e
+
+# Wait for PulseAudio to be ready
+wait_for_pulse() {
+    local max_attempts=30
+    local attempt=0
+    while [ $attempt -lt $max_attempts ]; do
+        if pactl info >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.5
+        attempt=$((attempt + 1))
+    done
+    echo "Warning: PulseAudio not ready after ${max_attempts} attempts"
+    return 1
+}
+
+# Set default audio input (microphone/source)
+set_default_audio_input() {
+    if ! command -v pactl &>/dev/null; then
+        echo "pactl not available, skipping audio input setup"
+        return 1
+    fi
+    
+    if ! wait_for_pulse; then
+        return 1
+    fi
+    
+    # Get list of available sources (input devices)
+    echo "Available audio input devices:"
+    pactl list sources short 2>/dev/null || true
+    
+    # Try to find and set a physical microphone as default
+    # Priority: USB mic > Built-in mic > Any available source
+    local default_source=""
+    
+    # Look for USB microphone first (usually better quality)
+    default_source=$(pactl list sources short 2>/dev/null | grep -i "usb" | grep -v "monitor" | head -1 | awk '{print $2}')
+    
+    # If no USB mic, look for any non-monitor input source
+    if [ -z "$default_source" ]; then
+        default_source=$(pactl list sources short 2>/dev/null | grep -v "monitor" | head -1 | awk '{print $2}')
+    fi
+    
+    # Set as default if found
+    if [ -n "$default_source" ]; then
+        pactl set-default-source "$default_source" 2>/dev/null && \
+            echo "✅ Default audio input set to: $default_source" || \
+            echo "⚠️  Failed to set default audio input"
+    else
+        echo "⚠️  No suitable audio input device found"
+    fi
+}
+
+# Set default webcam (v4l2 device)
+set_default_webcam() {
+    # List available video devices
+    if [ -d /dev ]; then
+        echo "Available video devices:"
+        ls -la /dev/video* 2>/dev/null || echo "No video devices found"
+    fi
+    
+    # Check if v4l2-ctl is available for more detailed info
+    if command -v v4l2-ctl &>/dev/null; then
+        echo "Video device details:"
+        for dev in /dev/video*; do
+            if [ -e "$dev" ]; then
+                echo "  $dev: $(v4l2-ctl --device=$dev --info 2>/dev/null | grep 'Card type' | cut -d: -f2 || echo 'unknown')"
+            fi
+        done
+    fi
+    
+    # Set V4L2 default device via environment (for applications that use it)
+    local default_video=""
+    if [ -e /dev/video0 ]; then
+        default_video="/dev/video0"
+    elif ls /dev/video* 1>/dev/null 2>&1; then
+        default_video=$(ls /dev/video* 2>/dev/null | head -1)
+    fi
+    
+    if [ -n "$default_video" ]; then
+        echo "✅ Default webcam available at: $default_video"
+        # Export for applications
+        export OPENCV_VIDEOIO_PRIORITY_V4L2=1
+        export V4L2_DEVICE="$default_video"
+    fi
+}
+
+# Main
+echo "🔧 Configuring default input devices..."
+set_default_audio_input
+set_default_webcam
+echo "✅ Input device configuration complete"
+EOF
+
+    distrobox enter "$BOX_NAME" -- sudo chmod +x /usr/local/bin/setup-default-inputs
+    
+    # Add to the developer user's profile so it runs on login
+    cat << 'EOF' | distrobox enter "$BOX_NAME" -- sudo tee -a /home/$INTERNAL_USER/.zshrc > /dev/null
+
+# Auto-configure default input devices on shell startup (runs silently)
+[ -x /usr/local/bin/setup-default-inputs ] && /usr/local/bin/setup-default-inputs >/dev/null 2>&1 &
+EOF
+
+    echo "✅ Default input device configuration installed"
+}
+
 function verify_host_home_protection() {
     echo "🔍 Verifying container setup: $BOX_NAME"
     
@@ -299,8 +474,8 @@ function verify_host_home_protection() {
 function install_bridge() {
     echo "bridge: Installing internal permission bridge..."
     
-    # Install socat for audio socket proxying
-    distrobox enter "$BOX_NAME" -- sudo apt-get install -y socat pulseaudio-utils > /dev/null 2>&1 || true
+    # Install socat for audio socket proxying and ALSA plugins for PulseAudio redirect
+    distrobox enter "$BOX_NAME" -- sudo apt-get install -y socat pulseaudio-utils libasound2-plugins > /dev/null 2>&1 || true
     
     cat << 'EOF' | distrobox enter "$BOX_NAME" -- sudo tee /usr/local/bin/run-as-dev > /dev/null
 #!/bin/bash
@@ -363,6 +538,19 @@ sudo -E -u developer bash -c '
     export XDG_RUNTIME_DIR="/tmp/runtime-developer"
     export PULSE_SERVER="unix:/tmp/runtime-developer/pulse/native"
     export PULSE_COOKIE="$HOME/.config/pulse/cookie"
+    
+    # --- SET DEFAULT INPUT DEVICES ---
+    # Set default audio input (microphone) if pactl is available
+    if command -v pactl &>/dev/null; then
+        # Try USB mic first, then any non-monitor source
+        DEFAULT_MIC=$(pactl list sources short 2>/dev/null | grep -i "usb" | grep -v "monitor" | head -1 | awk "{print \$2}")
+        [ -z "$DEFAULT_MIC" ] && DEFAULT_MIC=$(pactl list sources short 2>/dev/null | grep -v "monitor" | head -1 | awk "{print \$2}")
+        [ -n "$DEFAULT_MIC" ] && pactl set-default-source "$DEFAULT_MIC" 2>/dev/null || true
+    fi
+    
+    # Set default video device for applications
+    [ -e /dev/video0 ] && export V4L2_DEVICE="/dev/video0"
+    export OPENCV_VIDEOIO_PRIORITY_V4L2=1
     
     # --- DISPLAY FIXES ---
     unset WAYLAND_DISPLAY
@@ -660,7 +848,38 @@ apt-get update && apt-get install -y curl git zsh wget unzip build-essential sud
     libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev libncursesw5-dev xz-utils tk-dev libxml2-dev libxmlsec1-dev libffi-dev liblzma-dev \
     docker.io iptables libsecret-1-0 gnome-keyring dbus-x11 acl \
     libx11-xcb1 libxss1 libasound2t64 libnss3 libatk-bridge2.0-0 libgtk-3-0t64 libgbm1 fonts-noto-color-emoji \
-    clamav clamav-daemon unattended-upgrades xscreensaver
+    clamav clamav-daemon unattended-upgrades xscreensaver \
+    pulseaudio-utils alsa-utils libasound2-plugins
+
+# --- ALSA-to-PulseAudio Configuration ---
+# This is CRITICAL for applications (like PyAudio) that use ALSA directly
+# It redirects all ALSA calls to PulseAudio backend
+echo ">>> Configuring ALSA to use PulseAudio backend..."
+cat > /etc/asound.conf << 'ALSACONF'
+# Redirect ALSA to PulseAudio - fixes "cannot find card '0'" errors
+pcm.!default {
+    type pulse
+    fallback "sysdefault"
+    hint {
+        show on
+        description "Default ALSA Output (PulseAudio Sound Server)"
+    }
+}
+
+ctl.!default {
+    type pulse
+    fallback "sysdefault"
+}
+
+# For applications that specifically request "pulse"
+pcm.pulse {
+    type pulse
+}
+
+ctl.pulse {
+    type pulse
+}
+ALSACONF
 
 # Enable Unattended Upgrades
 echo 'Unattended-Upgrade::Allowed-Origins { "${distro_id}:${distro_codename}"; "${distro_id}:${distro_codename}-security"; };' > /etc/apt/apt.conf.d/50unattended-upgrades
@@ -728,6 +947,34 @@ cd "$HOME"
     echo 'export XDG_CACHE_HOME="$HOME/.cache"'
     echo '[ -z "$ZSH_VERSION" ] && exec /usr/bin/zsh -l'
 } >> "$HOME/.bashrc"
+
+# --- 1.5. ALSA-to-PulseAudio User Config ---
+# Create user-level .asoundrc for applications that need ALSA
+echo ">>> Configuring user ALSA to PulseAudio redirect..."
+cat > "$HOME/.asoundrc" << 'ALSACONF'
+# Redirect ALSA to PulseAudio (user config)
+pcm.!default {
+    type pulse
+    fallback "sysdefault"
+    hint {
+        show on
+        description "Default ALSA Output (PulseAudio Sound Server)"
+    }
+}
+
+ctl.!default {
+    type pulse
+    fallback "sysdefault"
+}
+
+pcm.pulse {
+    type pulse
+}
+
+ctl.pulse {
+    type pulse
+}
+ALSACONF
 
 # --- 2. ASDF INSTALLATION & GLOBAL DEFAULTS ---
 if [ ! -d ".asdf" ]; then 
@@ -813,6 +1060,7 @@ EOF
 
     install_bridge
     setup_video_permissions
+    setup_default_input_devices
     
     # Final verification
     echo ""

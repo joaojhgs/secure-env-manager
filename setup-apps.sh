@@ -108,25 +108,31 @@ DESKTOP
     # User-namespace sandbox remains active for protection
     FLAGS="--password-store=basic --disable-setuid-sandbox --disable-dev-shm-usage --ozone-platform=x11 --verbose"
     
+    # ELECTRON APP ISOLATION: Use unique user-data-dir per environment
+    # This prevents Electron apps (Cursor, VSCode, Chrome) from detecting instances
+    # in other containers and redirecting to them (single-instance lock issue)
+    ELECTRON_USER_DATA_FLAGS="--user-data-dir=/home/developer/.config/${BOX_NAME}"
+    
     # Only create launchers for installed apps
     if distrobox enter "$BOX_NAME" -- command -v code >/dev/null 2>&1; then
-        _generate_app "VSCode" "code --wait $FLAGS" "com.visualstudio.code"
+        _generate_app "VSCode" "code --wait $FLAGS ${ELECTRON_USER_DATA_FLAGS}-vscode" "com.visualstudio.code"
     fi
     
     if distrobox enter "$BOX_NAME" -- command -v cursor >/dev/null 2>&1; then
-        _generate_app "Cursor" "cursor --wait $FLAGS" "cursor"
+        _generate_app "Cursor" "cursor --wait $FLAGS ${ELECTRON_USER_DATA_FLAGS}-cursor" "cursor"
     fi
     
     if distrobox enter "$BOX_NAME" -- command -v brave-browser >/dev/null 2>&1; then
-        _generate_app "Brave" "brave-browser $FLAGS" "brave-browser"
+        _generate_app "Brave" "brave-browser $FLAGS ${ELECTRON_USER_DATA_FLAGS}-brave" "brave-browser"
     fi
     
     if distrobox enter "$BOX_NAME" -- command -v google-chrome >/dev/null 2>&1; then
-        _generate_app "Chrome" "google-chrome $FLAGS" "google-chrome"
+        _generate_app "Chrome" "google-chrome $FLAGS ${ELECTRON_USER_DATA_FLAGS}-chrome" "google-chrome"
     fi
     
     if distrobox enter "$BOX_NAME" -- command -v antigravity >/dev/null 2>&1; then
-        _generate_app "Antigravity" "antigravity" "antigravity"
+        # Antigravity is an Electron app, needs same flags as other Electron apps
+        _generate_app "Antigravity" "antigravity $FLAGS ${ELECTRON_USER_DATA_FLAGS}-antigravity" "antigravity"
     fi
     
     _generate_app "Terminal" "zsh" "utilities-terminal"
@@ -193,6 +199,18 @@ if ! command -v cursor &> /dev/null; then
     wget -O /tmp/cursor.deb "https://api2.cursor.sh/updates/download/golden/linux-x64-deb/cursor/"
     apt-get install -y /tmp/cursor.deb || apt-get install -f -y
     rm -f /tmp/cursor.deb
+fi
+
+# Antigravity
+if ! command -v antigravity &> /dev/null; then
+    echo "   Installing Antigravity..."
+    mkdir -p /etc/apt/keyrings
+    curl -fsSL https://us-central1-apt.pkg.dev/doc/repo-signing-key.gpg | \
+        gpg --dearmor --yes -o /etc/apt/keyrings/antigravity-repo-key.gpg
+    echo "deb [signed-by=/etc/apt/keyrings/antigravity-repo-key.gpg] https://us-central1-apt.pkg.dev/projects/antigravity-auto-updater-dev/ antigravity-debian main" | \
+        tee /etc/apt/sources.list.d/antigravity.list > /dev/null
+    apt-get update
+    apt-get install -y antigravity
 fi
 
 # BRAVE POLICIES & EXTENSIONS
@@ -283,6 +301,7 @@ cat > "$HOME/.config/mimeapps.list" << 'MIMEEOF'
 text/html=brave-browser.desktop
 x-scheme-handler/http=brave-browser.desktop
 x-scheme-handler/https=brave-browser.desktop
+application/x-antigravity=antigravity.desktop
 MIMEEOF
 
 echo "✅ User configurations complete."
@@ -301,4 +320,3 @@ create_launchers
 echo ""
 echo "🎉 SUCCESS! Applications installed and configured for '$BOX_NAME'."
 echo "💡 Launchers are available in your application menu."
-
