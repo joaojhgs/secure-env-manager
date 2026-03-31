@@ -471,6 +471,46 @@ function verify_host_home_protection() {
     return 0
 }
 
+function setup_docker_proxy() {
+    echo "🐳 Setting up Host Docker Socket Proxy..."
+    # We must ensure socat is installed on the host
+    if ! command -v socat &>/dev/null; then
+        echo "   Installing socat on host..."
+        sudo apt-get update && sudo apt-get install -y socat
+    fi
+
+    local SYSTEMD_USER_DIR="$HOST_HOME/.config/systemd/user"
+    local SERVICE_FILE="$SYSTEMD_USER_DIR/distrobox-docker-proxy.service"
+    
+    # Create directory using host user permissions
+    sudo -u "$HOST_USER" mkdir -p "$SYSTEMD_USER_DIR"
+    
+    # Create systemd service
+    cat << EOF | sudo -u "$HOST_USER" tee "$SERVICE_FILE" >/dev/null
+[Unit]
+Description=Distrobox Docker Socket Proxy
+
+[Service]
+ExecStart=/usr/bin/socat UNIX-LISTEN:/tmp/distrobox-docker.sock,fork,mode=0666 UNIX-CONNECT:/var/run/docker.sock
+Restart=always
+
+[Install]
+WantedBy=default.target
+EOF
+
+    # Reload and enable the service as the host user
+    sudo -u "$HOST_USER" XDG_RUNTIME_DIR="/run/user/$(id -u $HOST_USER)" systemctl --user daemon-reload
+    sudo -u "$HOST_USER" XDG_RUNTIME_DIR="/run/user/$(id -u $HOST_USER)" systemctl --user enable --now distrobox-docker-proxy.service
+    
+    # Wait briefly for socket to appear
+    sleep 1
+    if [ ! -S "/tmp/distrobox-docker.sock" ]; then
+        echo "⚠️ Docker proxy socket not created. Is docker running on the host?"
+    else
+        echo "✅ Host Docker proxy ready at /tmp/distrobox-docker.sock"
+    fi
+}
+
 function install_bridge() {
     echo "bridge: Installing internal permission bridge..."
     
@@ -673,6 +713,11 @@ elif [ "$ACTION" == "delete" ]; then
 elif [ "$ACTION" == "create" ]; then
     echo "🏗️  CREATING ROOTLESS ENVIRONMENT: $BOX_NAME"
     echo ""
+    
+    # Ensure background proxies are running
+    setup_docker_proxy
+    echo ""
+
     echo "🛡️  CONTAINER ISOLATION:"
     echo "   - Developer user will work in isolated /home/developer (persistent storage)"
     echo "   - Developer has NO sudo access inside the container"
@@ -806,6 +851,7 @@ elif [ "$ACTION" == "create" ]; then
             --volume "$WORK_DIR/home:/home/$INTERNAL_USER" \
             --home "$WORK_DIR/host_mask" \
             --unshare-process \
+            --init-hooks "rm -f /var/run/docker.sock 2>/dev/null; ln -s /run/host/tmp/distrobox-docker.sock /var/run/docker.sock" \
             --additional-flags "--ipc=private --shm-size=4g --cap-drop=ALL --cap-add=SYS_PTRACE --cap-add=SETUID --cap-add=SETGID $DEVICES $AUDIO_MOUNTS --volume /tmp/.X11-unix:/tmp/.X11-unix:ro" \
             --init --yes
         
@@ -846,7 +892,7 @@ echo ">>> Installing System & Compliance Packages..."
 apt-get update && apt-get install -y curl git zsh wget unzip build-essential sudo \
     software-properties-common ca-certificates gnupg xdg-utils desktop-file-utils xauth \
     libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev libncursesw5-dev xz-utils tk-dev libxml2-dev libxmlsec1-dev libffi-dev liblzma-dev \
-    docker.io iptables libsecret-1-0 gnome-keyring dbus-x11 acl \
+    docker.io docker-compose-v2 iptables libsecret-1-0 gnome-keyring dbus-x11 acl \
     libx11-xcb1 libxss1 libasound2t64 libnss3 libatk-bridge2.0-0 libgtk-3-0t64 libgbm1 fonts-noto-color-emoji \
     clamav clamav-daemon unattended-upgrades xscreensaver \
     pulseaudio-utils alsa-utils libasound2-plugins
@@ -885,6 +931,9 @@ ALSACONF
 echo 'Unattended-Upgrade::Allowed-Origins { "${distro_id}:${distro_codename}"; "${distro_id}:${distro_codename}-security"; };' > /etc/apt/apt.conf.d/50unattended-upgrades
 service unattended-upgrades start || true
 
+# Set up global Docker connection for all users in container
+echo 'export DOCKER_HOST="unix:///run/host/tmp/distrobox-docker.sock"' > /etc/profile.d/docker-host.sh
+chmod 644 /etc/profile.d/docker-host.sh
 
 INTERNAL_USER="developer"
 
@@ -945,6 +994,7 @@ cd "$HOME"
     echo 'export XDG_CONFIG_HOME="$HOME/.config"'
     echo 'export XDG_DATA_HOME="$HOME/.local/share"'
     echo 'export XDG_CACHE_HOME="$HOME/.cache"'
+    echo 'export DOCKER_HOST="unix:///run/host/tmp/distrobox-docker.sock"'
     echo '[ -z "$ZSH_VERSION" ] && exec /usr/bin/zsh -l'
 } >> "$HOME/.bashrc"
 
