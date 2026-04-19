@@ -61,8 +61,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ==============================================================================
 
 function show_help() {
-    echo "Usage: $0 [create|delete|mount|verify] [env_name]"
+    echo "Usage: $0 [create|recreate|delete|mount|verify] [env_name]"
     echo "  create  : Build a new secure environment (SOC2 Compliant)"
+    echo "  recreate: Rebuild container keeping encrypted storage (Safe Mode)"
     echo "  delete  : Destroy the container and wipe storage (Nuclear Mode)"
     echo "  mount   : Remount the encrypted storage (Run this after reboot)"
     echo "  verify  : Verify host home protection is working correctly"
@@ -710,8 +711,12 @@ elif [ "$ACTION" == "delete" ]; then
     echo "✅ Cleanup complete."
     exit 0
 
-elif [ "$ACTION" == "create" ]; then
-    echo "🏗️  CREATING ROOTLESS ENVIRONMENT: $BOX_NAME"
+elif [[ "$ACTION" == "create" || "$ACTION" == "recreate" ]]; then
+    if [ "$ACTION" == "recreate" ]; then
+        echo "♻️  RECREATING ROOTLESS ENVIRONMENT: $BOX_NAME (Preserving Data)"
+    else
+        echo "🏗️  CREATING ROOTLESS ENVIRONMENT: $BOX_NAME"
+    fi
     echo ""
     
     # Ensure background proxies are running
@@ -726,18 +731,33 @@ elif [ "$ACTION" == "create" ]; then
     
     # --- AUTO-CLEANUP CHECK ---
     if distrobox list | grep -q "$BOX_NAME"; then
-        echo "⚠️  Container '$BOX_NAME' already exists."
-        echo "   To apply all fixes, it must be recreated."
-        safe_read "   Recreate now? (y/n): " DO_RECREATE
-        if [[ "$DO_RECREATE" =~ ^[Yy]$ ]]; then
-            $0 delete "$BOX_NAME"
-        else
-            echo "   Skipping creation. Configuration may be incomplete."
+        if [ "$ACTION" == "create" ]; then
+            echo "⚠️  Container '$BOX_NAME' already exists."
+            echo "   To apply all fixes, it must be recreated."
+            safe_read "   Wipe entirely and recreate (WARNING: LOSES DATA)? (y/n): " DO_RECREATE
+            if [[ "$DO_RECREATE" =~ ^[Yy]$ ]]; then
+                $0 delete "$BOX_NAME"
+            else
+                echo "   Skipping creation. Configuration may be incomplete."
+            fi
+        elif [ "$ACTION" == "recreate" ]; then
+            echo "🛑 Stopping old container for safe recreation..."
+            distrobox stop "$BOX_NAME" --yes || true
+            distrobox rm "$BOX_NAME" --force || true
         fi
     fi
     
     safe_read "   Set password for internal user 'developer': " USER_PASS true
     if [ -z "$USER_PASS" ]; then echo "❌ Password cannot be empty."; exit 1; fi
+
+    safe_read "   Isolate network namespace? (y/N - allows container-only VPN but breaks localhost app sharing): " ISOLATE_NET
+    UNSHARE_NET_FLAG=""
+    if [[ "$ISOLATE_NET" =~ ^[Yy]$ ]]; then
+        UNSHARE_NET_FLAG="--unshare-netns"
+        echo "   -> Network will be isolated."
+    else
+        echo "   -> Network will be shared with the host (Default)."
+    fi
 
     # Ensure we have sudo access before proceeding (helps with stdin issues)
     echo "🔐 Checking sudo access..."
@@ -753,13 +773,24 @@ elif [ "$ACTION" == "create" ]; then
     
     if [ ! -d "$WORK_DIR" ]; then sudo mkdir -p "$WORK_DIR"; fi
     DO_ENCRYPT=""
-    # Call setup_encryption and capture return value
-    # Return 0 = encryption enabled, Return 1 = no encryption
-    # Use subshell to prevent set -e from exiting on return 1
-    if setup_encryption; then
-        ENCRYPTION_ENABLED=0
+
+    if [ "$ACTION" == "recreate" ] && [ -f "$IMG_FILE" ]; then
+        echo "♻️  Skipping encryption setup to preserve existing volume data."
+        if mount_encrypted; then
+            ENCRYPTION_ENABLED=0
+        else
+            echo "❌ Error mounting existing volume."
+            exit 1
+        fi
     else
-        ENCRYPTION_ENABLED=1
+        # Call setup_encryption and capture return value
+        # Return 0 = encryption enabled, Return 1 = no encryption
+        # Use subshell to prevent set -e from exiting on return 1
+        if setup_encryption; then
+            ENCRYPTION_ENABLED=0
+        else
+            ENCRYPTION_ENABLED=1
+        fi
     fi
     
     if ! distrobox list | grep -q "$BOX_NAME"; then
@@ -851,8 +882,9 @@ elif [ "$ACTION" == "create" ]; then
             --volume "$WORK_DIR/home:/home/$INTERNAL_USER" \
             --home "$WORK_DIR/host_mask" \
             --unshare-process \
+            $UNSHARE_NET_FLAG \
             --init-hooks "rm -f /var/run/docker.sock 2>/dev/null; ln -s /run/host/tmp/distrobox-docker.sock /var/run/docker.sock" \
-            --additional-flags "--ipc=private --shm-size=4g --cap-drop=ALL --cap-add=SYS_PTRACE --cap-add=SETUID --cap-add=SETGID $DEVICES $AUDIO_MOUNTS --volume /tmp/.X11-unix:/tmp/.X11-unix:ro" \
+            --additional-flags "--ipc=private --shm-size=4g --cap-drop=ALL --cap-add=SYS_PTRACE --cap-add=SETUID --cap-add=SETGID --cap-add=NET_ADMIN --device /dev/net/tun $DEVICES $AUDIO_MOUNTS --volume /tmp/.X11-unix:/tmp/.X11-unix:ro" \
             --init --yes
         
         # PROTECT HOST HOME: Set to 700 so only owner (skyron) can access

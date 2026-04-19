@@ -70,7 +70,16 @@ if [ -n "\$DISPLAY" ]; then
     SOCKET_NUM=\${DISPLAY#*:} 
     SOCKET_PATH="/tmp/.X11-unix/X\${SOCKET_NUM%.*}"
     if command -v setfacl &> /dev/null && [ -e "\$SOCKET_PATH" ]; then
-        setfacl -m u:\$(id -u):rw "\$SOCKET_PATH" 2>/dev/null || echo "Warning: Could not set X11 socket ACL"
+        # Grand access to the host user (Docker 1:1 mapping cases)
+        setfacl -m u:\$(id -u):rw "\$SOCKET_PATH" 2>/dev/null || true
+        setfacl -m u:1001:rw "\$SOCKET_PATH" 2>/dev/null || true
+        
+        # Grant access to the mapped user (Rootless Podman cases)
+        SUBUID_START=\$(grep "^\$(whoami):" /etc/subuid 2>/dev/null | cut -d: -f2)
+        if [ -n "\$SUBUID_START" ]; then
+            REAL_UID=\$((SUBUID_START + 1001 - 1))
+            setfacl -m u:\$REAL_UID:rw "\$SOCKET_PATH" 2>/dev/null || echo "Warning: Could not set X11 socket ACL for \$REAL_UID"
+        fi
     fi
     # REMOVED: chmod o+w fallback - this is a security risk (HSV-002)
 fi
