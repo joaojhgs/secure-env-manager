@@ -831,12 +831,12 @@ elif [[ "$ACTION" == "create" || "$ACTION" == "recreate" ]]; then
         # 2. --volume provides persistent storage at /home/$INTERNAL_USER for developer
         # 3. NO tmpfs needed - the --home redirect already provides the masking
         #
-        # Result: /home/skyron = empty folder (host_mask), /home/developer = isolated storage
+        # Result: /home/$HOST_USER = empty folder (host_mask), /home/developer = isolated storage
         #
         # SECURITY MODEL:
         # - Developer user has NO sudo group membership (can't sudo inside container)
         # - Host home is set to 700 (owner-only) - developer user can't access it
-        # - This is safe: skyron can still access on host, only "others" are blocked
+        # - This is safe: owner can still access on host, only "others" are blocked
         
         # Build device list based on available hardware
         DEVICES=""
@@ -887,7 +887,7 @@ elif [[ "$ACTION" == "create" || "$ACTION" == "recreate" ]]; then
             --additional-flags "--ipc=private --shm-size=4g --cap-drop=ALL --cap-add=SYS_PTRACE --cap-add=SETUID --cap-add=SETGID --cap-add=NET_ADMIN --device /dev/net/tun $DEVICES $AUDIO_MOUNTS --volume /tmp/.X11-unix:/tmp/.X11-unix:ro" \
             --init --yes
         
-        # PROTECT HOST HOME: Set to 700 so only owner (skyron) can access
+        # PROTECT HOST HOME: Set to 700 so only owner can access
         # This blocks the developer user (different UID) inside the container
         # Safe because: owner keeps full access, sudo still works, only "others" blocked
         echo "🔒 Setting host home to owner-only access (chmod 700)..."
