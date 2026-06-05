@@ -141,6 +141,32 @@ distrobox enter <env-name>
 distrobox enter <env-name> -- /usr/local/bin/run-as-dev bash
 ```
 
+### Advanced Usage Examples
+
+**Installing Custom Applications:**
+You can deploy your own extensions, binaries, and `.deb` files using `setup-apps.sh`:
+```bash
+# Install a .deb package that is on your host
+./setup-apps.sh <env-name> --deb /path/to/app.deb
+
+# Run an external script to install dependencies
+./setup-apps.sh <env-name> --script /path/to/install.sh
+
+# Run a specific command
+./setup-apps.sh <env-name> --cmd "sudo apt-get install htop -y"
+
+# Create a desktop shortcut for an app already inside the container
+./setup-apps.sh <env-name> --launcher-only
+```
+*(For a deeper dive on customizing default apps, check [docs/setup-apps-customization.md](docs/setup-apps-customization.md))*
+
+**Mounting Encrypted Environments:**
+After a reboot of the host machine, the container's encrypted image won't be mapped. Before starting your applications, mount it automatically via:
+```bash
+# Prompt for the environment's LUKS passphrase to unlock the volume
+sudo ./manage-safe-environement.sh mount <env-name>
+```
+
 ## 🎤📹 Audio/Video Support
 
 ### Audio Architecture
