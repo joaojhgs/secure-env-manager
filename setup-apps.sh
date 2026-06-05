@@ -4,7 +4,40 @@ set -e
 # ==============================================================================
 # CONFIGURATION
 # ==============================================================================
-BOX_NAME="$1"
+BOX_NAME=""
+INSTALL_DEB=""
+INSTALL_SCRIPT=""
+INSTALL_CMD=""
+LAUNCHER_ONLY="false"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -d|--deb) INSTALL_DEB="$2"; shift 2 ;;
+        -s|--script) INSTALL_SCRIPT="$2"; shift 2 ;;
+        -c|--cmd) INSTALL_CMD="$2"; shift 2 ;;
+        -l|--launcher-only) LAUNCHER_ONLY="true"; shift 1 ;;
+        -h|--help)
+            echo "Usage: $0 [env_name] [options]"
+            echo "  If no options are provided, runs the standard provisioning (VS Code, Brave, Chrome, etc)."
+            echo "Options:"
+            echo "  -d, --deb <file>        Install a .deb file into the container and create a shortcut"
+            echo "  -s, --script <file>     Run an installation script into the container and create a shortcut"
+            echo "  -c, --cmd <command>     Run a specific command interactively inside the container and create a shortcut"
+            echo "  -l, --launcher-only     Just create a host shortcut for an already-installed application"
+            echo "  -h, --help              Show this help message"
+            exit 0
+            ;;
+        *)
+            if [[ -z "$BOX_NAME" ]]; then
+                BOX_NAME="$1"
+                shift 1
+            else
+                echo "❌ Unknown argument: $1"
+                exit 1
+            fi
+            ;;
+    esac
+done
 
 if [[ -z "$BOX_NAME" ]]; then
     read -p "🔹 Enter Environment Name (e.g., work): " BOX_NAME < /dev/tty
@@ -22,13 +55,9 @@ INTERNAL_USER="developer"
 # HELPER FUNCTIONS
 # ==============================================================================
 
-function show_help() {
-    echo "Usage: $0 [env_name]"
-    echo "  Installs applications (VS Code, Brave, Chrome, Cursor) and extensions"
-    echo "  Creates launchers and MIME type mappings for the specified environment"
-}
-
 function check_container() {
+
+
     if ! distrobox list | grep -q "$BOX_NAME"; then
         echo "❌ Error: Container '$BOX_NAME' does not exist."
         echo "   Please create it first using: ./manage-safe-environement.sh create $BOX_NAME"
@@ -36,16 +65,13 @@ function check_container() {
     fi
 }
 
-function create_launchers() {
-    echo "🚀 Generating launchers..."
+function generate_app_launcher() {
+    local APP_NAME="$1"
+    local CMD="$2"
+    local ICON="$3"
+    local BIN_NAME="${BOX_NAME}-$(echo "$APP_NAME" | tr ' ' '-' | tr '[:upper:]' '[:lower:]')"
     
-    _generate_app() {
-        local APP_NAME="$1"
-        local CMD="$2"
-        local ICON="$3"
-        local BIN_NAME="${BOX_NAME}-$(echo "$APP_NAME" | tr ' ' '-' | tr '[:upper:]' '[:lower:]')"
-        
-        cat <<SCRIPT > "/tmp/$BIN_NAME"
+    cat <<SCRIPT > "/tmp/$BIN_NAME"
 #!/bin/bash
 
 # 1. PREPARE X11 KEY
@@ -96,11 +122,11 @@ else
     \$CMD_STR >> "\$LOG_DIR/${BIN_NAME}.log" 2>&1
 fi
 SCRIPT
-        sudo mv "/tmp/$BIN_NAME" "/usr/local/bin/$BIN_NAME"
-        sudo chmod +x "/usr/local/bin/$BIN_NAME"
+    sudo mv "/tmp/$BIN_NAME" "/usr/local/bin/$BIN_NAME"
+    sudo chmod +x "/usr/local/bin/$BIN_NAME"
 
-        mkdir -p ~/.local/share/applications
-        cat <<DESKTOP > ~/.local/share/applications/$BIN_NAME.desktop
+    mkdir -p ~/.local/share/applications
+    cat <<DESKTOP > ~/.local/share/applications/$BIN_NAME.desktop
 [Desktop Entry]
 Name=$APP_NAME - $BOX_NAME
 Exec=/usr/local/bin/$BIN_NAME %U
@@ -110,9 +136,34 @@ Terminal=false
 Categories=Development;
 StartupNotify=true
 DESKTOP
-    }
+}
 
-    # FLAGS - SECURITY: Removed --no-sandbox and --disable-gpu-sandbox (CVE-CUSTOM-002)
+function prompt_and_create_shortcut() {
+    echo ""
+    echo "🎨 Create a launcher shortcut for your application:"
+    read -p "   App Name (e.g., 'Spotify'): " APP_NAME < /dev/tty
+    read -p "   Launch Command (e.g., 'spotify'): " APP_CMD < /dev/tty
+    read -p "   Icon (e.g. 'utilities-terminal' or file.png. Leave empty to use default): " APP_ICON < /dev/tty
+    
+    if [ -z "$APP_ICON" ]; then APP_ICON="utilities-terminal"; fi
+    if [ -n "$APP_NAME" ] && [ -n "$APP_CMD" ]; then
+        generate_app_launcher "$APP_NAME" "$APP_CMD" "$APP_ICON"
+        echo "✅ Shortcut created: $APP_NAME - $BOX_NAME"
+    else
+        echo "⚠️  App Name and Command are required. Skipping shortcut creation."
+    fi
+}
+
+function configure_openvpn_persistence() {
+    # Ensure /run/openvpn is universally recreated via systemd overrides
+    # (Distrobox masks systemd-tmpfiles-setup.service on boot, so we inject a pre-start command)
+    distrobox enter "$BOX_NAME" -- sudo mkdir -p /etc/systemd/system/openvpn@.service.d
+    distrobox enter "$BOX_NAME" -- bash -c 'echo -e "[Service]\nExecStartPre=+/usr/bin/mkdir -p /run/openvpn" | sudo tee /etc/systemd/system/openvpn@.service.d/override.conf >/dev/null'
+    distrobox enter "$BOX_NAME" -- sudo systemctl daemon-reload
+}
+
+function create_launchers() {
+    echo "🚀 Generating launchers..."
     # Using --disable-setuid-sandbox is safe since container doesn't have setuid anyway
     # User-namespace sandbox remains active for protection
     FLAGS="--password-store=basic --disable-setuid-sandbox --disable-dev-shm-usage --ozone-platform=x11 --verbose"
@@ -124,31 +175,31 @@ DESKTOP
     
     # Only create launchers for installed apps
     if distrobox enter "$BOX_NAME" -- command -v code >/dev/null 2>&1; then
-        _generate_app "VSCode" "code --wait $FLAGS ${ELECTRON_USER_DATA_FLAGS}-vscode" "com.visualstudio.code"
+        generate_app_launcher "VSCode" "code --wait $FLAGS ${ELECTRON_USER_DATA_FLAGS}-vscode" "com.visualstudio.code"
     fi
     
     if distrobox enter "$BOX_NAME" -- command -v cursor >/dev/null 2>&1; then
-        _generate_app "Cursor" "cursor --wait $FLAGS ${ELECTRON_USER_DATA_FLAGS}-cursor" "cursor"
+        generate_app_launcher "Cursor" "cursor --wait $FLAGS ${ELECTRON_USER_DATA_FLAGS}-cursor" "cursor"
     fi
     
     if distrobox enter "$BOX_NAME" -- command -v brave-browser >/dev/null 2>&1; then
-        _generate_app "Brave" "brave-browser $FLAGS ${ELECTRON_USER_DATA_FLAGS}-brave" "brave-browser"
+        generate_app_launcher "Brave" "brave-browser $FLAGS ${ELECTRON_USER_DATA_FLAGS}-brave" "brave-browser"
     fi
     
     if distrobox enter "$BOX_NAME" -- command -v google-chrome >/dev/null 2>&1; then
-        _generate_app "Chrome" "google-chrome $FLAGS ${ELECTRON_USER_DATA_FLAGS}-chrome" "google-chrome"
+        generate_app_launcher "Chrome" "google-chrome $FLAGS ${ELECTRON_USER_DATA_FLAGS}-chrome" "google-chrome"
     fi
     
     if distrobox enter "$BOX_NAME" -- command -v antigravity >/dev/null 2>&1; then
         # Antigravity is an Electron app, needs same flags as other Electron apps
-        _generate_app "Antigravity" "antigravity $FLAGS ${ELECTRON_USER_DATA_FLAGS}-antigravity" "antigravity"
+        generate_app_launcher "Antigravity" "antigravity $FLAGS ${ELECTRON_USER_DATA_FLAGS}-antigravity" "antigravity"
     fi
     
-    _generate_app "Terminal" "zsh" "utilities-terminal"
+    generate_app_launcher "Terminal" "zsh" "utilities-terminal"
     
     # DRATA LAUNCHER CHECK
     if distrobox enter "$BOX_NAME" -- command -v drata-agent >/dev/null 2>&1; then
-         _generate_app "Drata" "drata-agent $FLAGS" "drata-agent"
+         generate_app_launcher "Drata" "drata-agent $FLAGS" "drata-agent"
     fi
     
     echo "✅ Launchers created."
@@ -164,6 +215,39 @@ if [ "$BOX_NAME" == "help" ] || [ "$BOX_NAME" == "-h" ] || [ "$BOX_NAME" == "--h
 fi
 
 check_container
+
+
+
+# --- CUSTOM INSTALLATION ROUTING ---
+if [ -n "$INSTALL_DEB" ] || [ -n "$INSTALL_SCRIPT" ] || [ -n "$INSTALL_CMD" ] || [ "$LAUNCHER_ONLY" = true ]; then
+    echo "⚙️  RUNNING CUSTOM SETTINGS FOR: $BOX_NAME"
+    if [ -n "$INSTALL_DEB" ]; then
+        echo "📦 Installing DEB package: $INSTALL_DEB"
+        if [ ! -f "$INSTALL_DEB" ]; then echo "❌ File not found: $INSTALL_DEB"; exit 1; fi
+        ABS_PATH=$(realpath "$INSTALL_DEB")
+        BASENAME=$(basename "$ABS_PATH")
+        podman cp "$ABS_PATH" "$BOX_NAME:/tmp/$BASENAME"
+        distrobox enter "$BOX_NAME" -- sh -c "sudo dpkg -i '/tmp/$BASENAME' || sudo apt-get install -f -y"
+        prompt_and_create_shortcut
+    elif [ -n "$INSTALL_SCRIPT" ]; then
+        echo "📜 Executing script: $INSTALL_SCRIPT"
+        if [ ! -f "$INSTALL_SCRIPT" ]; then echo "❌ File not found: $INSTALL_SCRIPT"; exit 1; fi
+        ABS_PATH=$(realpath "$INSTALL_SCRIPT")
+        BASENAME=$(basename "$ABS_PATH")
+        podman cp "$ABS_PATH" "$BOX_NAME:/tmp/$BASENAME"
+        distrobox enter "$BOX_NAME" -- bash -c "chmod +x '/tmp/$BASENAME' && '/tmp/$BASENAME'"
+        prompt_and_create_shortcut
+    elif [ -n "$INSTALL_CMD" ]; then
+        echo "⚙️ Running command: $INSTALL_CMD"
+        distrobox enter "$BOX_NAME" -- sh -c "$INSTALL_CMD"
+        prompt_and_create_shortcut
+    elif [ "$LAUNCHER_ONLY" = true ]; then
+        prompt_and_create_shortcut
+    fi
+    echo ""
+    echo "🎉 SUCCESS! Custom installation complete for '$BOX_NAME'."
+    exit 0
+fi
 
 echo "📦 INSTALLING APPLICATIONS FOR: $BOX_NAME"
 
@@ -320,6 +404,11 @@ cat "$USER_SCRIPT" | distrobox enter "$BOX_NAME" -- sudo tee /home/$INTERNAL_USE
 distrobox enter "$BOX_NAME" -- sudo chown $INTERNAL_USER:$INTERNAL_USER /home/$INTERNAL_USER/user-apps.sh
 distrobox enter "$BOX_NAME" -- sudo chmod +x /home/$INTERNAL_USER/user-apps.sh
 distrobox enter "$BOX_NAME" -- sudo -u "$INTERNAL_USER" /bin/bash /home/$INTERNAL_USER/user-apps.sh
+
+# -----------------------------------------------------------
+# RECONFIGURE SYSTEMD-TMPFILES (OpenVPN Auto-Connection)
+# -----------------------------------------------------------
+configure_openvpn_persistence
 
 # -----------------------------------------------------------
 # CREATE LAUNCHERS
