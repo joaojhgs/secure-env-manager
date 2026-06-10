@@ -294,6 +294,24 @@ if ! command -v cursor &> /dev/null; then
     rm -f /tmp/cursor.deb
 fi
 
+# tmux (required by oh-my-claudecode and oh-my-codex team workflows)
+if ! command -v tmux &> /dev/null; then
+    echo "   Installing tmux..."
+    apt-get install -y tmux
+fi
+
+# jq (required by RTK wrapper hook for permissionDecision stripping)
+if ! command -v jq &> /dev/null; then
+    echo "   Installing jq..."
+    apt-get install -y jq
+fi
+
+# git (required for obsidian-second-brain and other skill clones)
+if ! command -v git &> /dev/null; then
+    echo "   Installing git..."
+    apt-get install -y git
+fi
+
 # Antigravity
 if ! command -v antigravity &> /dev/null; then
     echo "   Installing Antigravity..."
@@ -396,6 +414,302 @@ x-scheme-handler/http=brave-browser.desktop
 x-scheme-handler/https=brave-browser.desktop
 application/x-antigravity=antigravity.desktop
 MIMEEOF
+
+# --- 3. AI CLIs (Claude Code, Codex, Cursor CLI, oh-my-claude, oh-my-codex, Multica) ---
+echo ">>> Installing AI agent CLIs and orchestration tools..."
+
+export ASDF_DIR="$HOME/.asdf"
+if [ -f "$HOME/.asdf/asdf.sh" ]; then . "$HOME/.asdf/asdf.sh"; fi
+
+# Ensure user-local bin is on PATH for cursor-agent and multica
+mkdir -p "$HOME/.local/bin"
+if ! echo "$PATH" | tr ':' '\n' | grep -qx "$HOME/.local/bin"; then
+    export PATH="$HOME/.local/bin:$PATH"
+fi
+for rc in "$HOME/.profile" "$HOME/.zshrc"; do
+    if [ -f "$rc" ] && ! grep -qF '$HOME/.local/bin' "$rc"; then
+        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$rc"
+    fi
+done
+
+if command -v npm >/dev/null 2>&1; then
+    echo "   Installing Claude Code and oh-my-claudecode..."
+    npm install -g @anthropic-ai/claude-code oh-my-claude-sisyphus@latest || echo "   Failed to install Claude Code tools"
+
+    echo "   Installing OpenAI Codex and oh-my-codex..."
+    npm install -g @openai/codex oh-my-codex@latest || echo "   Failed to install OpenAI Codex tools"
+
+    if command -v omc >/dev/null 2>&1; then
+        echo "   Running omc setup (oh-my-claudecode skills, agents, hooks)..."
+        omc setup --quiet || echo "   omc setup failed (run 'omc setup' manually after provisioning)"
+    fi
+
+    if command -v omx >/dev/null 2>&1; then
+        echo "   Running omx setup (oh-my-codex skills, prompts, config)..."
+        omx setup || echo "   omx setup failed (run 'omx setup' manually after provisioning)"
+    fi
+else
+    echo "⚠️ npm is not available. Skipping npm-based AI CLI installations."
+fi
+
+# Cursor CLI (cursor-agent) — separate from the Cursor IDE .deb
+if ! command -v cursor-agent >/dev/null 2>&1; then
+    echo "   Installing Cursor CLI (cursor-agent)..."
+    curl -fsSL https://cursor.com/install | bash || echo "   Failed to install Cursor CLI"
+else
+    echo "   Cursor CLI already installed."
+fi
+
+# Multica CLI only (no self-hosted server)
+if ! command -v multica >/dev/null 2>&1; then
+    echo "   Installing Multica CLI..."
+    MULTICA_BIN_DIR="$HOME/.local/bin" \
+        curl -fsSL https://raw.githubusercontent.com/multica-ai/multica/main/scripts/install.sh | bash \
+        || echo "   Failed to install Multica CLI"
+else
+    echo "   Multica CLI already installed."
+fi
+
+# Copy a skill folder into every agent's global skills directory
+install_skill_to_all_agents() {
+    local skill_name="$1"
+    local skill_src="$2"
+    local agent_skill_dirs=(
+        "$HOME/.claude/skills"
+        "$HOME/.codex/skills"
+        "$HOME/.cursor/skills"
+        "$HOME/.agents/skills"
+    )
+    if [ ! -f "$skill_src/SKILL.md" ]; then
+        echo "   $skill_name: no SKILL.md at $skill_src (skipped)."
+        return 1
+    fi
+    for dest_root in "${agent_skill_dirs[@]}"; do
+        mkdir -p "$dest_root"
+        rm -rf "$dest_root/$skill_name"
+        cp -r "$skill_src" "$dest_root/$skill_name"
+    done
+    echo "   Installed skill: $skill_name (claude, codex, cursor, .agents)"
+}
+
+# token-savings skill — fetched from upstream repo at provisioning time
+install_token_savings_skill() {
+    local cache="$HOME/.cache/token-savings"
+    local base="https://raw.githubusercontent.com/andrew-tenkara/CLAUDE-MD/main/skills/token-savings"
+    rm -rf "$cache"
+    mkdir -p "$cache/scripts"
+    curl -fsSL "$base/SKILL.md" -o "$cache/SKILL.md" \
+        && curl -fsSL "$base/scripts/preflight.sh" -o "$cache/scripts/preflight.sh" \
+        && curl -fsSL "$base/scripts/dashboard.sh" -o "$cache/scripts/dashboard.sh" \
+        && curl -fsSL "$base/scripts/tui.py" -o "$cache/scripts/tui.py" \
+        && chmod +x "$cache/scripts/"*.sh \
+        && install_skill_to_all_agents "token-savings" "$cache" \
+        && echo "   Installed skill: token-savings (from andrew-tenkara/CLAUDE-MD)" \
+        || echo "   Failed to install token-savings skill from $base"
+}
+
+echo "   Installing token-savings skill from GitHub..."
+install_token_savings_skill || echo "   Failed to install token-savings skill"
+
+# Agentmemory, CodeGraph, taste-skill, obsidian-second-brain
+install_agent_plugins() {
+    export CI=1
+
+    # --- agentmemory: persistent memory + MCP ---
+    if command -v npm >/dev/null 2>&1; then
+        echo "   Installing agentmemory..."
+        npm install -g @agentmemory/agentmemory || echo "   Failed to install agentmemory npm package"
+
+        if command -v agentmemory >/dev/null 2>&1; then
+            if ! curl -fsS http://localhost:3111/agentmemory/livez >/dev/null 2>&1; then
+                echo "   Starting agentmemory server..."
+                nohup agentmemory >/tmp/agentmemory.log 2>&1 &
+                for _ in $(seq 1 15); do
+                    curl -fsS http://localhost:3111/agentmemory/livez >/dev/null 2>&1 && break
+                    sleep 1
+                done
+            fi
+
+            if command -v claude >/dev/null 2>&1; then
+                agentmemory connect claude-code || echo "   agentmemory connect claude-code failed"
+            fi
+            if command -v codex >/dev/null 2>&1; then
+                agentmemory connect codex --with-hooks 2>/dev/null || agentmemory connect codex || echo "   agentmemory connect codex failed"
+                codex plugin marketplace add rohitg00/agentmemory 2>/dev/null || true
+                codex plugin add agentmemory@agentmemory 2>/dev/null || true
+            fi
+            if command -v cursor-agent >/dev/null 2>&1 || command -v cursor >/dev/null 2>&1; then
+                agentmemory connect cursor || echo "   agentmemory connect cursor failed"
+            fi
+
+            npx skills add rohitg00/agentmemory -y -a '*' 2>/dev/null \
+                || npx skills add rohitg00/agentmemory -y 2>/dev/null \
+                || echo "   Failed to install agentmemory skills"
+        fi
+    fi
+
+    # --- codegraph: semantic code intelligence MCP ---
+    if ! command -v codegraph >/dev/null 2>&1; then
+        echo "   Installing CodeGraph CLI..."
+        curl -fsSL https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.sh | sh \
+            || echo "   Failed to install CodeGraph"
+    fi
+    export PATH="$HOME/.local/bin:$PATH"
+    if command -v codegraph >/dev/null 2>&1; then
+        echo "   Configuring CodeGraph for claude, codex, cursor..."
+        codegraph install --target=claude,cursor,codex --yes 2>/dev/null \
+            || codegraph install --target=auto --yes 2>/dev/null \
+            || codegraph install --yes 2>/dev/null \
+            || echo "   codegraph install failed"
+    fi
+
+    # --- taste-skill: anti-slop frontend design skills ---
+    if command -v npx >/dev/null 2>&1; then
+        echo "   Installing taste-skill for all agents..."
+        npx skills add https://github.com/Leonxlnx/taste-skill -y -a '*' 2>/dev/null \
+            || npx skills add https://github.com/Leonxlnx/taste-skill -y 2>/dev/null \
+            || echo "   Failed to install taste-skill"
+    fi
+
+    # --- obsidian-second-brain: cross-CLI Obsidian vault skill ---
+    local obsidian_skill="$HOME/.claude/skills/obsidian-second-brain"
+    echo "   Installing obsidian-second-brain..."
+    if [ -d "$obsidian_skill/.git" ]; then
+        git -C "$obsidian_skill" pull --ff-only 2>/dev/null || true
+    else
+        rm -rf "$obsidian_skill"
+        git clone https://github.com/eugeniughelbur/obsidian-second-brain "$obsidian_skill" \
+            || echo "   Failed to clone obsidian-second-brain"
+    fi
+    if [ -d "$obsidian_skill" ]; then
+        install_skill_to_all_agents "obsidian-second-brain" "$obsidian_skill" || true
+        chmod +x "$obsidian_skill"/hooks/*.sh 2>/dev/null || true
+        chmod +x "$obsidian_skill"/hooks/*.py 2>/dev/null || true
+        bash "$obsidian_skill/scripts/install-codex-wrappers.sh" 2>/dev/null || true
+        if [ -n "${OBSIDIAN_VAULT_PATH:-}" ] && [ -d "${OBSIDIAN_VAULT_PATH/#\~/$HOME}" ]; then
+            bash "$obsidian_skill/scripts/setup.sh" "${OBSIDIAN_VAULT_PATH/#\~/$HOME}" \
+                || echo "   obsidian-second-brain setup.sh failed"
+        else
+            echo "   obsidian-second-brain: set OBSIDIAN_VAULT_PATH and run scripts/setup.sh to wire your vault"
+        fi
+    fi
+}
+
+echo "   Installing agentmemory, CodeGraph, taste-skill, obsidian-second-brain..."
+install_agent_plugins || echo "   Failed to configure some agent plugins"
+
+# RTK + Headroom token savings stack (Claude Code hooks)
+# See: https://andrewpatterson.dev/posts/token-savings-rtk-headroom/
+install_token_savings_stack() {
+    local hooks_dir="$HOME/.claude/hooks"
+    local settings="$HOME/.claude/settings.json"
+    mkdir -p "$hooks_dir"
+
+    # RTK — filters Bash command output before it enters context (PreToolUse)
+    if ! command -v rtk >/dev/null 2>&1; then
+        echo "   Installing RTK (Rust Token Killer)..."
+        curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh | sh \
+            || echo "   Failed to install RTK"
+    fi
+
+    if command -v rtk >/dev/null 2>&1; then
+        echo "   Wiring RTK Claude Code hook..."
+        rtk init -g --auto-patch 2>/dev/null || rtk init -g --hook-only 2>/dev/null || true
+
+        # Wrapper survives rtk init -g regenerations and strips permissionDecision (silent savings killer)
+        cat > "$hooks_dir/rtk-wrapper.sh" << 'RTKWRAPPER'
+#!/usr/bin/env bash
+export PATH="$HOME/.local/bin:/usr/local/bin:$HOME/.cargo/bin:$PATH"
+
+OUTPUT=$(bash "$(dirname "$0")/rtk-rewrite.sh" "$@")
+EXIT_CODE=$?
+
+if [ -z "$OUTPUT" ] || [ $EXIT_CODE -ne 0 ]; then
+    exit $EXIT_CODE
+fi
+
+echo "$OUTPUT" | jq '
+  if .hookSpecificOutput then
+    .hookSpecificOutput |= del(.permissionDecision, .permissionDecisionReason)
+  else
+    .
+  end
+' 2>/dev/null || echo "$OUTPUT"
+
+exit $EXIT_CODE
+RTKWRAPPER
+        chmod +x "$hooks_dir/rtk-wrapper.sh"
+    fi
+
+    # Headroom — compresses API context via local proxy (SessionStart)
+    if command -v python3 >/dev/null 2>&1; then
+        echo "   Installing Headroom proxy..."
+        python3 -m pip install --user "headroom-ai[proxy]" rich 2>/dev/null \
+            || pip install --user "headroom-ai[proxy]" rich 2>/dev/null \
+            || echo "   Failed to install Headroom"
+    fi
+
+    cat > "$hooks_dir/headroom-autostart.sh" << 'HEADROOMHOOK'
+#!/usr/bin/env bash
+set -euo pipefail
+
+export PATH="$HOME/.local/bin:$PATH"
+
+PORT=8787
+HEALTH_URL="http://localhost:${PORT}/health"
+
+if ! curl -sf "$HEALTH_URL" >/dev/null 2>&1; then
+    headroom proxy --port "$PORT" >/dev/null 2>&1 &
+    for _ in $(seq 1 15); do
+        curl -sf "$HEALTH_URL" >/dev/null 2>&1 && break
+        sleep 1
+    done
+fi
+
+if [[ -n "${CLAUDE_ENV_FILE:-}" ]]; then
+    echo "export ANTHROPIC_BASE_URL=http://localhost:${PORT}" >> "$CLAUDE_ENV_FILE"
+    echo "export NO_PROXY=localhost,127.0.0.1" >> "$CLAUDE_ENV_FILE"
+fi
+
+exit 0
+HEADROOMHOOK
+    chmod +x "$hooks_dir/headroom-autostart.sh"
+
+    # Merge hooks into settings.json — RTK PreToolUse must be LAST among Bash matchers
+    if command -v jq >/dev/null 2>&1; then
+        if [ ! -f "$settings" ]; then
+            echo '{}' > "$settings"
+        fi
+        tmp_settings="$(mktemp)"
+        jq --arg rtk "bash $hooks_dir/rtk-wrapper.sh" \
+           --arg headroom "bash $hooks_dir/headroom-autostart.sh" '
+          .hooks //= {} |
+          .hooks.SessionStart //= [] |
+          if ([.hooks.SessionStart[]? | select(.hooks[]?.command? | test("headroom"))] | length) == 0 then
+            .hooks.SessionStart += [{"hooks": [{"type": "command", "command": $headroom}]}]
+          else . end |
+          .hooks.PreToolUse //= [] |
+          .hooks.PreToolUse |= map(
+            if .matcher == "Bash" then
+              .hooks |= map(select(.command | test("rtk-wrapper") | not))
+            else . end
+          ) |
+          .hooks.PreToolUse += [{"matcher": "Bash", "hooks": [{"type": "command", "command": $rtk}]}]
+        ' "$settings" > "$tmp_settings" && mv "$tmp_settings" "$settings"
+        echo "   RTK + Headroom hooks registered in ~/.claude/settings.json"
+    else
+        echo "   jq not available — wire RTK/Headroom hooks manually or run /token-savings in Claude Code"
+    fi
+}
+
+echo "   Setting up RTK + Headroom token savings..."
+install_token_savings_stack || echo "   Failed to configure token savings stack"
+
+if command -v multica >/dev/null 2>&1; then
+    echo "   Multica CLI installed. Run 'multica setup' after provisioning to log in and start the daemon."
+fi
+
+echo "✅ AI agent CLIs and skills configured."
 
 echo "✅ User configurations complete."
 EOF
