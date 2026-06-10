@@ -877,8 +877,19 @@ elif [[ "$ACTION" == "create" || "$ACTION" == "recreate" ]]; then
         #
         # NOTE: Removed --unshare-devsys as it prevents access to audio/video devices
         # Device access is controlled explicitly via --device flags instead
+
+        # Always scope container hostname to env.host (e.g. university.skyron-notebook)
+        HOST_HOSTNAME="$(hostname -s 2>/dev/null || hostname)"
+        CONTAINER_HOSTNAME="${BOX_NAME}.${HOST_HOSTNAME}"
+        if [ "$(printf '%s' "$CONTAINER_HOSTNAME" | wc -m)" -gt 64 ]; then
+            echo "❌ Error: Container hostname '$CONTAINER_HOSTNAME' exceeds 64 characters."
+            exit 1
+        fi
+        echo "   Container hostname: $CONTAINER_HOSTNAME"
+
         distrobox create --name "$BOX_NAME" \
             --image "ubuntu:24.04" \
+            --hostname "$CONTAINER_HOSTNAME" \
             --volume "$WORK_DIR/home:/home/$INTERNAL_USER" \
             --home "$WORK_DIR/host_mask" \
             --unshare-process \
