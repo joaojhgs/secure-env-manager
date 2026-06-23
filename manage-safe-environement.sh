@@ -615,8 +615,8 @@ sudo -E -u developer bash -c '
         xauth -f "$XAUTHORITY" nmerge "$XAUTH_SOURCE_FILE" 2>/dev/null
     fi
 
-    # ENVIRONMENT
-    export PATH="/opt/isolated_wrappers:/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games:$PATH"
+    # ENVIRONMENT (~/.local/bin after system paths; asdf shims prepend on top)
+    export PATH="/opt/isolated_wrappers:/usr/local/bin:/usr/bin:/bin:/usr/local/games:/usr/games:$HOME/.local/bin:$PATH"
     export ASDF_DIR="$HOME/.asdf"
     if [ -f "$HOME/.asdf/asdf.sh" ]; then . "$HOME/.asdf/asdf.sh"; fi
     export BROWSER=brave-browser

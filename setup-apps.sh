@@ -421,6 +421,24 @@ echo ">>> Installing AI agent CLIs and orchestration tools..."
 export ASDF_DIR="$HOME/.asdf"
 if [ -f "$HOME/.asdf/asdf.sh" ]; then . "$HOME/.asdf/asdf.sh"; fi
 
+# run-as-dev sources asdf but does not put ~/.local/bin on PATH; shim local-bin CLIs
+# so they resolve the same way npm globals (claude, codex) do via asdf reshim nodejs.
+ensure_asdf_shim_for_local_bin() {
+    local cmd_name="$1"
+    local shim_target="${2:-$HOME/.local/bin/$cmd_name}"
+    if [ ! -e "$shim_target" ]; then
+        return 0
+    fi
+    local shims_dir="$HOME/.asdf/shims"
+    mkdir -p "$shims_dir"
+    cat > "$shims_dir/$cmd_name" << SHIMEOF
+#!/usr/bin/env bash
+exec "$shim_target" "\$@"
+SHIMEOF
+    chmod +x "$shims_dir/$cmd_name"
+    echo "   Created asdf shim: $shims_dir/$cmd_name -> $shim_target"
+}
+
 # Ensure user-local bin is on PATH for cursor-agent and multica
 mkdir -p "$HOME/.local/bin"
 if ! echo "$PATH" | tr ':' '\n' | grep -qx "$HOME/.local/bin"; then
@@ -448,6 +466,11 @@ if command -v npm >/dev/null 2>&1; then
         echo "   Running omx setup (oh-my-codex skills, prompts, config)..."
         omx setup || echo "   omx setup failed (run 'omx setup' manually after provisioning)"
     fi
+
+    if command -v asdf >/dev/null 2>&1; then
+        echo "   Refreshing asdf shims for npm global CLIs..."
+        asdf reshim nodejs 2>/dev/null || true
+    fi
 else
     echo "⚠️ npm is not available. Skipping npm-based AI CLI installations."
 fi
@@ -459,6 +482,8 @@ if ! command -v cursor-agent >/dev/null 2>&1; then
 else
     echo "   Cursor CLI already installed."
 fi
+ensure_asdf_shim_for_local_bin cursor-agent
+ensure_asdf_shim_for_local_bin agent "$HOME/.local/bin/cursor-agent"
 
 # Multica CLI only (no self-hosted server)
 if ! command -v multica >/dev/null 2>&1; then
