@@ -59,7 +59,7 @@ To snapshot and transfer an existing rootless Distrobox without deleting its
 source data:
 
 ```bash
-./migrate-environment.sh personal /mnt/hdd3/secure-env-manager
+./manage-safe-environement.sh migrate personal /mnt/hdd3/secure-env-manager
 ```
 
 ### Transfer between computers
@@ -68,14 +68,14 @@ Create a password-encrypted portable bundle containing the OCI root filesystem,
 the isolated developer home, container metadata, and checksums:
 
 ```bash
-./transfer-environment.sh export personal /mnt/backup/personal.sem.tar.gpg
+./manage-safe-environement.sh export personal /mnt/backup/personal.sem.tar.gpg
 ```
 
 Copy it over SSH and import it on another Linux computer:
 
 ```bash
-./transfer-environment.sh send /mnt/backup/personal.sem.tar.gpg user@new-pc:/srv/transfers/
-./transfer-environment.sh import /srv/transfers/personal.sem.tar.gpg /mnt/hdd3/secure-env-manager personal
+./manage-safe-environement.sh send /mnt/backup/personal.sem.tar.gpg user@new-pc:/srv/transfers/
+./manage-safe-environement.sh import /srv/transfers/personal.sem.tar.gpg /mnt/hdd3/secure-env-manager personal
 ```
 
 Exports can instead be encrypted to a GPG public key with `--recipient`. Private
