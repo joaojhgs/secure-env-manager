@@ -62,6 +62,28 @@ source data:
 ./migrate-environment.sh personal /mnt/hdd3/secure-env-manager
 ```
 
+### Transfer between computers
+
+Create a password-encrypted portable bundle containing the OCI root filesystem,
+the isolated developer home, container metadata, and checksums:
+
+```bash
+./transfer-environment.sh export personal /mnt/backup/personal.sem.tar.gpg
+```
+
+Copy it over SSH and import it on another Linux computer:
+
+```bash
+./transfer-environment.sh send /mnt/backup/personal.sem.tar.gpg user@new-pc:/srv/transfers/
+./transfer-environment.sh import /srv/transfers/personal.sem.tar.gpg /mnt/hdd3/secure-env-manager personal
+```
+
+Exports can instead be encrypted to a GPG public key with `--recipient`. Private
+agent credentials may be present in the developer home, so unencrypted portable
+bundles are intentionally unsupported. Import preserves container-relative file
+ownership even when the two computers use different Podman subordinate UID/GID
+ranges, and refuses to overwrite an existing container or developer home.
+
 This will:
 - Create a 100GB sparse LUKS-encrypted image (optional)
 - Create a Distrobox container with Ubuntu 24.04
