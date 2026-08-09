@@ -47,6 +47,21 @@ chmod +x *.sh
 sudo ./manage-safe-environement.sh create work
 ```
 
+To place the environment on a dedicated ext4 disk instead of `/opt`:
+
+```bash
+SEM_STORAGE_ROOT=/mnt/hdd3/secure-env-manager/environments \
+SEM_IMAGE_ROOT=/mnt/hdd3/secure-env-manager/images \
+./manage-safe-environement.sh create work
+```
+
+To snapshot and transfer an existing rootless Distrobox without deleting its
+source data:
+
+```bash
+./migrate-environment.sh personal /mnt/hdd3/secure-env-manager
+```
+
 This will:
 - Create a 100GB sparse LUKS-encrypted image (optional)
 - Create a Distrobox container with Ubuntu 24.04

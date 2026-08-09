@@ -45,8 +45,15 @@ fi
 if [[ -z "$BOX_NAME" ]]; then BOX_NAME="work-env"; fi
 
 # Storage Configuration
-WORK_DIR="/opt/isolated_${BOX_NAME}"
-IMG_FILE="/var/lib/isolated_${BOX_NAME}.img"
+# Override these to place environments on a dedicated Linux filesystem:
+#   SEM_STORAGE_ROOT=/mnt/hdd3/secure-env-manager/environments
+#   SEM_IMAGE_ROOT=/mnt/hdd3/secure-env-manager/images
+# SEM_CONTAINER_IMAGE can point at a migrated/snapshotted container image.
+SEM_STORAGE_ROOT="${SEM_STORAGE_ROOT:-/opt}"
+SEM_IMAGE_ROOT="${SEM_IMAGE_ROOT:-/var/lib}"
+SEM_CONTAINER_IMAGE="${SEM_CONTAINER_IMAGE:-ubuntu:24.04}"
+WORK_DIR="${SEM_STORAGE_ROOT%/}/isolated_${BOX_NAME}"
+IMG_FILE="${SEM_IMAGE_ROOT%/}/isolated_${BOX_NAME}.img"
 MAPPER_NAME="iso_${BOX_NAME}"
 IMG_SIZE="100G"
 
@@ -888,14 +895,14 @@ elif [[ "$ACTION" == "create" || "$ACTION" == "recreate" ]]; then
         echo "   Container hostname: $CONTAINER_HOSTNAME"
 
         distrobox create --name "$BOX_NAME" \
-            --image "ubuntu:24.04" \
+            --image "$SEM_CONTAINER_IMAGE" \
             --hostname "$CONTAINER_HOSTNAME" \
             --volume "$WORK_DIR/home:/home/$INTERNAL_USER" \
             --home "$WORK_DIR/host_mask" \
             --unshare-process \
             $UNSHARE_NET_FLAG \
             --init-hooks "rm -f /var/run/docker.sock 2>/dev/null; ln -s /run/host/tmp/distrobox-docker.sock /var/run/docker.sock" \
-            --additional-flags "--ipc=private --shm-size=4g --cap-drop=ALL --cap-add=SYS_PTRACE --cap-add=SETUID --cap-add=SETGID --cap-add=NET_ADMIN --device /dev/net/tun $DEVICES $AUDIO_MOUNTS --volume /tmp/.X11-unix:/tmp/.X11-unix:ro" \
+            --additional-flags "--privileged=false --ipc=private --shm-size=4g --cap-drop=ALL --cap-add=SYS_ADMIN --cap-add=SYS_PTRACE --cap-add=SETUID --cap-add=SETGID --cap-add=CHOWN --cap-add=DAC_OVERRIDE --cap-add=FOWNER --cap-add=FSETID --cap-add=KILL --cap-add=NET_BIND_SERVICE --cap-add=SETFCAP --cap-add=SETPCAP --cap-add=SYS_CHROOT --cap-add=NET_ADMIN --device /dev/net/tun $DEVICES $AUDIO_MOUNTS --volume /tmp/.X11-unix:/tmp/.X11-unix:ro" \
             --init --yes
         
         # PROTECT HOST HOME: Set to 700 so only owner can access
