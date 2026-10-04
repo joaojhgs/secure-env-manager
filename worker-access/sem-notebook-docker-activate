@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Exact root operation granted to the notebook owner by the staging bootstrap.
+# Only retire an idle legacy proxy; never stop Docker, Distrobox or app containers.
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+[[ "$EUID" == 0 && $# == 1 && "$1" == activate ]] || exit 64
+config=/etc/sem-worker-access/notebook-migration.conf
+[[ "$(stat -c '%u:%g:%a' /etc/sem-worker-access)" == 0:0:755 && "$(stat -c '%u:%g:%a' "$config")" == 0:0:600 ]] || exit 65
+source "$config"
+[[ "$SEM_OWNER" =~ ^[a-z_][a-z0-9_-]*$ && "$SEM_BACKUP" == /var/backups/sem-worker-access/notebook-* && -d "$SEM_BACKUP" ]] || exit 66
+[[ -z "${SUDO_USER:-}" || "$SUDO_USER" == "$SEM_OWNER" ]] || exit 67
+owner_uid=$(id -u "$SEM_OWNER")
+owner_home=$(getent passwd "$SEM_OWNER" | cut -d: -f6)
+owner_env=(env "XDG_RUNTIME_DIR=/run/user/$owner_uid" "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$owner_uid/bus")
+as_owner() { runuser -u "$SEM_OWNER" -- "${owner_env[@]}" "$@"; }
+die() { echo "ERROR: $*" >&2; exit 1; }
+verify_builder_routes() {
+  local socket="$1" scope response
+  for scope in personal university work; do
+    response=$(as_owner podman exec --user developer "$scope" curl --fail --silent --show-error --max-time 10 --unix-socket "$socket" http://localhost/info)
+    printf '%s' "$response" | python3 -c 'import json,sys; data=json.load(sys.stdin); scope=sys.argv[1]; assert "name=rootless" in data["SecurityOptions"]; assert data["DockerRootDir"] == "/var/lib/sem-builders/"+scope+"/.local/share/docker"' "$scope" || die "Incorrect private Docker route for $scope."
+    echo "PASS: $scope reaches its own rootless Docker."
+  done
+}
+# Test the exact byte relay/credentials/cgroup policy on a separate socket first.
+verify_builder_routes /run/host/run/sem-docker-compat/check.sock
+unit="$owner_home/.config/systemd/user/distrobox-docker-proxy.service"
+[[ -f "$unit" && "$(sha256sum "$unit" | cut -d' ' -f1)" == "$SEM_PROXY_SHA256" ]] || die 'Legacy unit changed since staging; review before activation.'
+socket=/tmp/distrobox-docker.sock
+[[ -S "$socket" && ! -L "$socket" && "$(stat -c %u "$socket")" == "$owner_uid" ]] || die 'Legacy socket is not the expected host-user proxy.'
+proxy_pid=$(as_owner systemctl --user show distrobox-docker-proxy.service -p MainPID --value)
+[[ "$proxy_pid" =~ ^[0-9]+$ && "$proxy_pid" -gt 1 ]] || die 'Legacy listener is not active as expected.'
+# Block NEW developer connections before checking existing socat children.
+# Already open clients are not terminated: abort and restore mode if any remain.
+previous_mode=$(stat -c %a "$socket")
+chmod 0600 "$socket"
+if pgrep -P "$proxy_pid" >/dev/null; then
+  chmod "$previous_mode" "$socket"
+  die 'Legacy Docker has active client connections; no listener was stopped. Retry after they finish.'
+fi
+[[ "$(as_owner systemctl --user show distrobox-docker-proxy.service -p MainPID --value)" == "$proxy_pid" ]] || { chmod "$previous_mode" "$socket"; die 'Listener changed during checks; retry.'; }
+docker ps --format '{{.ID}} {{.Names}} {{.Status}}' > "$SEM_BACKUP/host-containers.before-activation.txt"
+as_owner systemctl --user stop distrobox-docker-proxy.service
+# Preserve the user unit name but remove rootful restart/fallback on login/boot.
+install -o "$SEM_OWNER" -g "$(id -gn "$SEM_OWNER")" -m 0644 /etc/sem-worker-access/legacy-proxy-disabled.service "$unit"
+as_owner systemctl --user daemon-reload
+as_owner systemctl --user start distrobox-docker-proxy.service
+systemctl enable --now sem-docker-compat.socket
+verify_builder_routes /run/host/tmp/distrobox-docker.sock
+docker ps --format '{{.ID}} {{.Names}} {{.Status}}' > "$SEM_BACKUP/host-containers.after-activation.txt"
+echo 'ACTIVATED: all three legacy routes now select private rootless builders.'
+echo 'Host Docker, app containers/volumes and Distroboxes were not stopped, recreated or deleted.'
+echo "Protected original unit and inventory: $SEM_BACKUP"
+echo 'OpenSandbox still requires its separate root-socket route to be resolved before cloud-worker approval.'

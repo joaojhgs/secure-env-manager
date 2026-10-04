@@ -74,11 +74,13 @@ function generate_app_launcher() {
     cat <<SCRIPT > "/tmp/$BIN_NAME"
 #!/bin/bash
 
-# 1. PREPARE X11 KEY
-X_FILE="/tmp/.xauth_transfer_\${USER}"
+# 1. TRANSFER ONLY THE X11 KEY (the host's /tmp is deliberately not mounted).
+distrobox enter $BOX_NAME -- true || exit 1
+X_FILE=\$(podman exec --user 0 $BOX_NAME mktemp /tmp/.sem-xauth.XXXXXX) || exit 1
+trap 'podman exec --user 0 $BOX_NAME rm -f -- "\$X_FILE" >/dev/null 2>&1 || true' EXIT
 if command -v xauth >/dev/null; then
-    xauth nlist \$DISPLAY | sed -e 's/^..../ffff/' > "\$X_FILE"
-    chmod 644 "\$X_FILE"
+    xauth nlist "\$DISPLAY" | sed -e 's/^..../ffff/' | \
+        podman exec -i --user 0 $BOX_NAME sh -c 'umask 077; tee "\$1" >/dev/null; chown developer:developer "\$1"' -- "\$X_FILE" || exit 1
 fi
 
 # 2. CALL BRIDGE (pass HOST_UID for audio access)

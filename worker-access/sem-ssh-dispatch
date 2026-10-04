@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+scope="${SSH_ORIGINAL_COMMAND:-}"
+[[ "$scope" =~ ^[a-z][a-z0-9_-]{0,21}$ ]] || {
+  echo 'This identity only transports SSH to an approved environment.' >&2
+  exit 64
+}
+[[ -f "/etc/sem-worker-access/$scope.conf" ]] || exit 69
+# Docker-only scopes have no sudo transport grant. Both the root-owned config
+# and exact sudoers command are required; a syntactically valid name is not a grant.
+exec sudo -n /usr/local/libexec/sem-worker-connect "$scope"

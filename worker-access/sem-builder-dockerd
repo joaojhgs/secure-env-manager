@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+prepare_private_developer_mountpoint() {
+  # Exact mountpoint and private propagation are required before changing even
+  # a symlink. Never resolve a copy-up link into the original host home.
+  [[ "$(findmnt -rn --mountpoint /home -o FSTYPE)" == tmpfs && "$(findmnt -rn --mountpoint /home -o PROPAGATION)" == private ]] || {
+    echo 'Refusing to change /home outside the private copy-up mount.' >&2
+    return 67
+  }
+  if [[ -L /home/developer ]]; then
+    # RootlessKit copies existing host entries as links inside its private tmpfs.
+    # Remove only this link; the underlying host directory is never touched.
+    unlink -- /home/developer || return
+  elif [[ -e /home/developer ]]; then
+    echo 'Unexpected non-symlink /home/developer in the builder namespace.' >&2
+    return 68
+  fi
+  mkdir -m 0755 /home/developer
+}
+scope="${SEM_BUILDER_SCOPE:-}"
+[[ "$scope" =~ ^[a-z][a-z0-9_-]{0,21}$ ]] || exit 64
+config="/etc/sem-worker-access/$scope.conf"
+if [[ "${1:-}" == start ]]; then
+  shift
+  [[ -z "${_DOCKERD_ROOTLESS_CHILD:-}" && "$(id -u)" != 0 && "$(id -u)" == "$(id -u "sem-build-$scope")" ]] || exit 65
+  # Validate ownership BEFORE entering the user namespace: host root is an
+  # unmapped UID there, not namespace root. Keep the root-controlled parent.
+  [[ "$(stat -c '%u:%g:%a' /etc/sem-worker-access)" == 0:0:755 && "$(stat -c '%u:%g:%a' "$config")" == 0:0:644 ]] || exit 66
+  SEM_VERIFIED_CONFIG_SHA256="$(sha256sum "$config" | cut -d' ' -f1)"
+  export SEM_VERIFIED_CONFIG_SHA256
+  export DOCKERD=/usr/local/libexec/sem-builder-dockerd
+  exec /usr/bin/dockerd-rootless.sh "$@"
+fi
+[[ "${_DOCKERD_ROOTLESS_CHILD:-}" == 1 && "$(id -u)" == 0 ]] || exit 65
+# /etc is copied up by RootlessKit. Verify the content carried across from the
+# host preflight, rather than incorrectly expecting the host UID0 to map to0.
+[[ "${SEM_VERIFIED_CONFIG_SHA256:-}" =~ ^[a-f0-9]{64}$ && "$(sha256sum "$config" | cut -d' ' -f1)" == "$SEM_VERIFIED_CONFIG_SHA256" ]] || exit 66
+# This entrypoint runs only inside RootlessKit's private mount namespace.
+source "$config"
+[[ "$SEM_SCOPE" == "$scope" && "$SEM_BUILDER_HOME" == "/var/lib/sem-builders/$scope" ]] || exit 66
+prepare_private_developer_mountpoint
+mount --bind "$SEM_BUILDER_HOME/workspace" /home/developer
+exec /usr/bin/dockerd "$@"

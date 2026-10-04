@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+[[ "$EUID" == 0 && $# == 1 ]] || exit 64
+scope="$1"
+[[ "$scope" =~ ^[a-z][a-z0-9_-]{0,21}$ ]] || exit 65
+config="/etc/sem-worker-access/$scope.conf"
+[[ "$(stat -c '%u:%g:%a' /etc/sem-worker-access)" == 0:0:755 && "$(stat -c '%u:%g:%a' "$config")" == 0:0:644 ]] || exit 66
+source "$config"
+[[ "$SEM_SCOPE" == "$scope" && "$SEM_SSH_PORT" =~ ^[0-9]+$ && "$SEM_SSH_PORT" -ge 1024 && "$SEM_SSH_PORT" -le 65535 ]] || exit 67
+owner_uid="$(id -u "$SEM_OWNER")"
+owner_env=(env "XDG_RUNTIME_DIR=/run/user/$owner_uid" "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$owner_uid/bus")
+running="$(runuser -u "$SEM_OWNER" -- "${owner_env[@]}" podman inspect --format '{{.State.Running}}' "$scope")"
+if [[ "$running" != true ]]; then
+  runuser -u "$SEM_OWNER" -- "${owner_env[@]}" podman start "$scope" >/dev/null
+fi
+for ((attempt=0;attempt<60;attempt++)); do
+  if runuser -u "$SEM_OWNER" -- "${owner_env[@]}" podman exec --user developer "$scope" /usr/bin/nc -z 127.0.0.1 "$SEM_SSH_PORT" >/dev/null 2>&1; then
+    # Outer SSH is only a byte pipe; the inner SSH owns authentication and PTYs.
+    exec runuser -u "$SEM_OWNER" -- "${owner_env[@]}" podman exec -i --user developer "$scope" /usr/bin/nc -N 127.0.0.1 "$SEM_SSH_PORT"
+  fi
+  sleep 1
+done
+echo 'Environment SSH did not become ready.' >&2
+exit 70

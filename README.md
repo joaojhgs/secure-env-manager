@@ -1,16 +1,18 @@
 # 🔐 Secure Environment Manager
 
-A comprehensive toolkit for creating **LUKS-encrypted, isolated development environments** using Distrobox containers. Designed for secure, SOC2-compliant development workflows where host system isolation is critical.
+A toolkit for creating development environments with optional **LUKS-encrypted storage**, a separate developer account, and separate-user rootless Docker using Distrobox and rootless Podman. These controls are not a SOC2 certification or a complete hostile-code sandbox.
 
 ## 🎯 Purpose
 
-This project solves the challenge of running untrusted or sensitive development workloads in complete isolation from your host system while maintaining full desktop integration (GUI apps, audio, video conferencing).
+This project separates development storage and Docker privileges while retaining desktop integration (GUI apps, audio, video conferencing). Distrobox deliberately integrates with its host; see [worker access and remaining security boundaries](docs/worker-access.md) before connecting an externally hosted agent controller.
 
 ### Key Features
 
-- **🔒 LUKS Encryption** - All environment data stored in encrypted sparse images
-- **🏠 Host Home Masking** - Host's home directory is completely hidden from container
-- **🛡️ Capability Restrictions** - Minimal Linux capabilities (no `--privileged`)
+- **🔒 Optional LUKS Encryption** - Environment storage can use encrypted sparse images
+- **🏠 Host Filesystem Allowlist** - Dedicated developer home; no ambient host-root/home/tmp binds
+- **🛡️ Explicit Capability Configuration** - Not equivalent to a fully sandboxed container
+- **🐳 Separate Rootless Docker** - Locked non-root host builder identity; no host-root Docker proxy or docker-group grant
+- **🔑 Restricted SSH Jump** - Transport-only host account; inner SSH owns terminals and files
 - **🎨 Full Desktop Integration** - X11 display, audio (PulseAudio/PipeWire), webcam
 - **📦 Isolated Storage** - Each environment has its own encrypted persistent storage
 - **🔑 SSH Key Generation** - Automatic per-environment SSH keys for git operations
@@ -20,11 +22,14 @@ This project solves the challenge of running untrusted or sensitive development 
 
 ### Host System
 - Linux with systemd (tested on Ubuntu 22.04+, Fedora 38+)
-- Podman (rootless) or Docker
+- Podman (rootless; the manager rejects root-owned create/setup operations)
 - Distrobox 1.5+
+- Python 3.11+, GPG, zstd (filesystem policy, verification and encrypted backups)
 - cryptsetup (for LUKS encryption)
 - X11 display server
 - PulseAudio or PipeWire (for audio)
+- Host Docker rootless tools (`dockerd-rootless.sh`, `rootlesskit`, `newuidmap`, `newgidmap`, `slirp4netns`), `socat`, systemd user services
+- Kernel/filesystem/util-linux support for `X-mount.idmap`; installation tests this on a small private fixture and refuses a chmod/chown/ACL fallback
 
 ### Installation
 ```bash
@@ -44,14 +49,14 @@ chmod +x *.sh
 
 ### 1. Create a Secure Environment
 ```bash
-sudo ./manage-safe-environement.sh create work
+./manage-safe-environement.sh create work
 ```
 
 To place the environment on a dedicated ext4 disk instead of `/opt`:
 
 ```bash
-SEM_STORAGE_ROOT=/mnt/hdd3/secure-env-manager/environments \
-SEM_IMAGE_ROOT=/mnt/hdd3/secure-env-manager/images \
+SEM_STORAGE_ROOT=/mnt/hdd2/secure-env-manager/environments \
+SEM_IMAGE_ROOT=/mnt/hdd2/secure-env-manager/images \
 ./manage-safe-environement.sh create work
 ```
 
@@ -59,7 +64,7 @@ To snapshot and transfer an existing rootless Distrobox without deleting its
 source data:
 
 ```bash
-./manage-safe-environement.sh migrate personal /mnt/hdd3/secure-env-manager
+./manage-safe-environement.sh migrate personal /mnt/hdd2/secure-env-manager
 ```
 
 ### Transfer between computers
@@ -75,10 +80,18 @@ Copy it over SSH and import it on another Linux computer:
 
 ```bash
 ./manage-safe-environement.sh send /mnt/backup/personal.sem.tar.gpg user@new-pc:/srv/transfers/
-./manage-safe-environement.sh import /srv/transfers/personal.sem.tar.gpg /mnt/hdd3/secure-env-manager personal
+./manage-safe-environement.sh import /srv/transfers/personal.sem.tar.gpg /mnt/hdd2/secure-env-manager personal
 ```
 
-Exports can instead be encrypted to a GPG public key with `--recipient`. Private
+Exports can instead be encrypted to a GPG public key with `--recipient`, or use
+`--passphrase-file /path/to/0600-owned-key` for noninteractive backups. Version 2
+compresses both the OCI image and developer home; import remains compatible with
+version 1. `--exclude-file` accepts an explicit list of verified regenerable paths
+relative to the developer home, stored in the encrypted bundle for transparency.
+`--stream-home` uses version 3 to stream/compress/encrypt the home directly,
+avoiding a second full home archive in staging. Import accepts all three versions
+and restores on the selected Linux filesystem, not host tmpfs.
+Private
 agent credentials may be present in the developer home, so unencrypted portable
 bundles are intentionally unsupported. Import preserves container-relative file
 ownership even when the two computers use different Podman subordinate UID/GID
@@ -87,10 +100,54 @@ ranges, and refuses to overwrite an existing container or developer home.
 This will:
 - Create a 100GB sparse LUKS-encrypted image (optional)
 - Create a Distrobox container with Ubuntu 24.04
-- Configure host home masking
+- Remove Distrobox's implicit host root/home/tmp filesystem mounts
 - Set up the `developer` user with isolated home
 - Generate environment-specific SSH keys
 - Install the permission bridge for GUI apps
+
+Creation automatically provisions a locked `sem-build-<environment>` host user,
+private rootless Docker storage/socket and a private ID-mapped workspace view.
+Bind mounts keep `/home/developer` paths and developer file ownership. Missing
+rootless prerequisites fail closed; the old world-writable host-root proxy is
+never created. Missing prerequisites are reported, not installed by an unpinned
+remote installation script. See [setup details](docs/worker-access.md).
+
+For an existing environment, additive setup is available without recreation:
+
+```bash
+./manage-safe-environement.sh setup-docker personal
+```
+
+If distroboxes deliberately share the same developer identity, explicitly accept
+cross-environment data/API access:
+
+```bash
+./manage-safe-environement.sh setup-docker university --allow-shared-developer
+# For a new installation on a shared-identity host:
+SEM_ALLOW_SHARED_DEVELOPER=1 ./manage-safe-environement.sh create university
+```
+
+This does **not** revoke an existing shared host-root Docker proxy or make broad
+host mounts safe. Existing shells keep their old Docker exports until reopened;
+revoking old access is a separate, deliberately scheduled step.
+
+At the end of creation, the manager asks separately whether to configure
+key-only SSH and whether to configure the jump proxy. The jump proxy starts a
+stopped Distrobox on the first SSH connection, waits for its SSH daemon, and
+then forwards the connection. Existing environments can be configured with:
+
+```bash
+./manage-safe-environement.sh setup-ssh personal
+```
+
+The generated local alias is `sem-<host>-<environment>`. To reach the box from
+another machine through its host, use the printed `ProxyCommand` in that
+client's SSH configuration. The restricted jump account tunnels through Podman, so it also works
+for environments with isolated networking. Each box receives a unique
+loopback-only port and accepts only the generated `developer` key; password and
+root SSH logins are disabled. Host and inner SSH public keys are pinned locally;
+the outer `orca-jump` account has no host shell, PTY or arbitrary forwarding.
+Never use or transfer the unrestricted human-host key for a VPS agent controller.
 
 ### 2. Install Applications
 ```bash
@@ -118,6 +175,10 @@ distrobox enter work -- /usr/local/bin/run-as-dev brave-browser
 
 ## 📁 Architecture
 
+The diagram below illustrates the intended developer-account separation, not
+proof of actual encryption, hidden alternate host paths, or container-root
+isolation. Audit the running container configuration; see the security notes.
+
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                        HOST SYSTEM                          │
@@ -129,7 +190,7 @@ distrobox enter work -- /usr/local/bin/run-as-dev brave-browser
 │  ┌───────────────────────────────────────────────────────┐  │
 │  │ /opt/isolated_{env}/ - LUKS ENCRYPTED STORAGE         │  │
 │  │   ├── /home → Container's /home/developer             │  │
-│  │   └── /host_mask → Empty dir masks host home          │  │
+│  │   └── /host_mask → Private administrative home        │  │
 │  └───────────────────────────────────────────────────────┘  │
 │                                                             │
 │  ┌─────────────────────────────────────────────────────────┐│
@@ -141,10 +202,10 @@ distrobox enter work -- /usr/local/bin/run-as-dev brave-browser
 │  │  └─────────────────────────────────────────────────┘   ││
 │  │                                                         ││
 │  │  Security Controls:                                     ││
-│  │  • --cap-drop=ALL (minimal capabilities)                ││
+│  │  • Explicit capabilities/devices retained for integration││
 │  │  • --ipc=private (isolated IPC namespace)               ││
 │  │  • --unshare-process (PID namespace isolation)          ││
-│  │  • Host home masked with empty tmpfs                    ││
+│  │  • Host root/home/tmp binds removed by mount allowlist ││
 │  └─────────────────────────────────────────────────────────┘│
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -154,7 +215,7 @@ distrobox enter work -- /usr/local/bin/run-as-dev brave-browser
 ### Environment Lifecycle
 ```bash
 # Create new environment
-sudo ./manage-safe-environement.sh create <env-name>
+./manage-safe-environement.sh create <env-name>
 
 # Delete environment (DESTROYS ALL DATA)
 sudo ./manage-safe-environement.sh delete <env-name>
@@ -241,11 +302,11 @@ KERNEL=="video[0-9]*", MODE="0666"
 ## 🛡️ Security Model
 
 ### What's Protected
-- ✅ Host home directory completely hidden
+- Host root/home/tmp binds removed for newly created or explicitly migrated boxes; verify actual mounts on older boxes.
 - ✅ No `--privileged` flag (capability-based restrictions)
 - ✅ Browser sandboxing enabled
 - ✅ X11 access restricted to current user only
-- ✅ No docker group (prevents container escape)
+- No host Docker group; the scoped Docker API belongs to a separate rootless builder identity.
 - ✅ Encrypted storage at rest (LUKS)
 
 ### Capabilities Granted
@@ -254,12 +315,18 @@ KERNEL=="video[0-9]*", MODE="0666"
 | `SYS_PTRACE` | Debugging tools (strace, gdb) |
 | `SETUID` | sudo functionality |
 | `SETGID` | Group switching for sudo |
+| `SYS_ADMIN` and other configured capabilities | Existing Distrobox integration; preserved, not a hostile-code isolation guarantee |
 
 ### Attack Surface Reduction
 - IPC namespace isolated (`--ipc=private`)
 - PID namespace isolated (`--unshare-process`)
 - Device access explicitly enumerated
 - No raw network namespace access
+
+This is a filesystem-exposure reduction, not a complete sandbox. Retained X11,
+audio, devices, capabilities and host networking remain deliberate attack
+surfaces. The architecture diagram does not certify existing boxes;
+run the mount/root/developer verification described in [filesystem-boundary.md](docs/filesystem-boundary.md).
 
 ## 📝 Files Overview
 

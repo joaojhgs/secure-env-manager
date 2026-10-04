@@ -5,7 +5,7 @@ set -e
 # ==============================================================================
 # PORTABLE MIGRATION / TRANSFER COMMANDS
 # ==============================================================================
-SUPPORTED_BUNDLE_VERSION=1
+SUPPORTED_BUNDLE_VERSION=3
 SEM_CLEANUP_STAGING=""
 SEM_CLEANUP_OUTPUT_TMP=""
 SEM_CLEANUP_IMAGE=""
@@ -16,7 +16,6 @@ cleanup_export() {
     if [[ "$SEM_CLEANUP_RESTART" == true && -n "$SEM_CLEANUP_BOX" ]]; then
         # A cancelled podman commit/save can leave the overlay mount attached.
         podman unmount "$SEM_CLEANUP_BOX" >/dev/null 2>&1 || true
-        podman start "$SEM_CLEANUP_BOX" >/dev/null 2>&1 || true
     fi
     if [[ -n "$SEM_CLEANUP_IMAGE" ]]; then
         podman image rm "$SEM_CLEANUP_IMAGE" >/dev/null 2>&1 || true
@@ -26,6 +25,11 @@ cleanup_export() {
     fi
     if [[ -n "$SEM_CLEANUP_OUTPUT_TMP" ]]; then
         rm -f -- "$SEM_CLEANUP_OUTPUT_TMP"
+    fi
+    # Free failed staging/output before restarting: ENOSPC must not leave the
+    # original unable to create its runtime/journal files during recovery.
+    if [[ "$SEM_CLEANUP_RESTART" == true && -n "$SEM_CLEANUP_BOX" ]]; then
+        podman start "$SEM_CLEANUP_BOX" >/dev/null 2>&1 || true
     fi
 }
 
@@ -40,7 +44,7 @@ usage() {
 Portable, encrypted Distrobox transfer bundles.
 
 Usage:
-  ./manage-safe-environement.sh export <box> <bundle.gpg> [--recipient <gpg-id>]
+  ./manage-safe-environement.sh export <box> <bundle.gpg> [export-options]
   ./manage-safe-environement.sh import <bundle.gpg> <storage-root> [new-box-name]
   ./manage-safe-environement.sh send <bundle.gpg> <ssh-destination>
 
@@ -57,11 +61,19 @@ Examples:
 
   # On the destination computer
   ./manage-safe-environement.sh import personal.sem.tar.gpg \
-      /mnt/hdd3/secure-env-manager personal
+      /mnt/hdd2/secure-env-manager personal
 
 The bundle contains a portable OCI image, the isolated developer home with
 container-relative ownership/ACLs/xattrs, the source container definition, a
 manifest, and checksums. Import never deletes an existing container or home.
+
+Export options:
+  --recipient <gpg-id>        Encrypt to a public key instead of a password.
+  --passphrase-file <file>    Noninteractive encryption; owned regular mode 0600.
+  --exclude-file <file>       Exact regenerable paths relative to developer home.
+  --stream-home              Avoid staging a second full home archive (v3).
+  --keep-snapshot            Retain the OCI image and write a .snapshot sidecar.
+  --leave-stopped            Leave the box stopped ONLY after successful export.
 EOF
 }
 
@@ -97,7 +109,7 @@ verify_linux_destination() {
 
 export_bundle() {
     [[ $# -ge 2 ]] || { usage >&2; exit 2; }
-    local box="$1" output="$2" recipient=""
+    local box="$1" output="$2" recipient="" passphrase_file="" exclude_file="" keep_snapshot=false leave_stopped=false stream_home=false bundle_version=2
     shift 2
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -106,9 +118,24 @@ export_bundle() {
                 recipient="$2"
                 shift 2
                 ;;
+            --passphrase-file)
+                [[ $# -ge 2 ]] || die "--passphrase-file requires a protected file"
+                passphrase_file="$2"
+                [[ -f "$passphrase_file" && ! -L "$passphrase_file" && $(stat -c %u "$passphrase_file") == "$(id -u)" && $(stat -c %a "$passphrase_file") == 600 ]] || die 'Passphrase file must be owned by you, regular, and mode 0600.'
+                shift 2
+                ;;
+            --exclude-file)
+                [[ $# -ge 2 && -f "$2" ]] || die '--exclude-file requires an explicit list of regenerable paths relative to the developer home.'
+                exclude_file="$(realpath "$2")"
+                shift 2
+                ;;
+            --keep-snapshot) keep_snapshot=true; shift ;;
+            --leave-stopped) leave_stopped=true; shift ;;
+            --stream-home) stream_home=true; bundle_version=3; shift ;;
             *) die "unknown export option: $1" ;;
         esac
     done
+    [[ -z "$recipient" || -z "$passphrase_file" ]] || die 'Choose recipient or passphrase file, not both.'
 
     require_commands podman distrobox gpg tar zstd sha256sum mktemp
     [[ $EUID -ne 0 ]] || die "run as the regular rootless Podman user, not root"
@@ -140,15 +167,27 @@ export_bundle() {
     fi
     echo "Creating OCI image snapshot..."
     podman commit "$box" "$image" >/dev/null
-    podman save --format oci-archive -o "$staging/rootfs.oci.tar" "$image"
+    # Compress the OCI archive too: staging an uncompressed installed system can
+    # exhaust the very filesystem this backup is meant to protect.
+    set -o pipefail
+    podman save --format oci-archive "$image" | zstd -T2 -3 -o "$staging/rootfs.oci.tar.zst"
 
     echo "Archiving developer home with container-relative ownership..."
-    podman unshare tar --acls --xattrs --numeric-owner --sparse -cpf - \
-        -C "$source_home" . | zstd -T0 -3 -o "$staging/developer-home.tar.zst"
+    local -a tar_excludes=()
+    if [[ -n "$exclude_file" ]]; then
+        cp -- "$exclude_file" "$staging/home-exclusions.txt"
+        tar_excludes=(--no-wildcards --exclude-from="$staging/home-exclusions.txt")
+    else
+        touch "$staging/home-exclusions.txt"
+    fi
+    if [[ "$stream_home" == false ]]; then
+        podman unshare tar --acls --xattrs --numeric-owner --sparse "${tar_excludes[@]}" -cpf - \
+            -C "$source_home" . | zstd -T2 -3 -o "$staging/developer-home.tar.zst"
+    fi
 
     podman inspect "$box" > "$staging/container-inspect.json"
     cat > "$staging/manifest.env" <<EOF
-BUNDLE_VERSION=$SUPPORTED_BUNDLE_VERSION
+BUNDLE_VERSION=$bundle_version
 BOX_NAME=$box
 CREATED_UTC=$stamp
 IMAGE_REF=$image
@@ -157,19 +196,48 @@ DEVELOPER_UID=$developer_uid
 DEVELOPER_GID=$developer_gid
 SOURCE_HOME=$source_home
 EOF
-    (cd "$staging" && sha256sum rootfs.oci.tar developer-home.tar.zst container-inspect.json manifest.env > SHA256SUMS)
+    local -a bundle_members=(manifest.env SHA256SUMS rootfs.oci.tar.zst container-inspect.json home-exclusions.txt)
+    if [[ "$stream_home" == true ]]; then
+        (cd "$staging" && sha256sum rootfs.oci.tar.zst container-inspect.json manifest.env home-exclusions.txt > SHA256SUMS)
+    else
+        bundle_members+=(developer-home.tar.zst)
+        (cd "$staging" && sha256sum rootfs.oci.tar.zst developer-home.tar.zst container-inspect.json manifest.env home-exclusions.txt > SHA256SUMS)
+    fi
+    emit_bundle() {
+        if [[ "$stream_home" == true ]]; then
+            # Version 3 avoids keeping a second full home archive. GPG integrity,
+            # zstd's checksum and the final encrypted-file SHA cover every home
+            # byte; SHA256SUMS additionally verifies staged metadata/image files.
+            podman unshare tar --acls --xattrs --numeric-owner --sparse "${tar_excludes[@]}" \
+                --transform='flags=rh;s,^\.$,home,;s,^\./,home/,' -cpf - -C "$staging" "${bundle_members[@]}" \
+                -C "$source_home" . | zstd -T2 -3
+        else
+            tar -C "$staging" -cpf - "${bundle_members[@]}"
+        fi
+    }
 
     echo "Encrypting transfer bundle..."
     if [[ -n "$recipient" ]]; then
-        tar -C "$staging" -cpf - manifest.env SHA256SUMS rootfs.oci.tar developer-home.tar.zst container-inspect.json |
+        emit_bundle |
             gpg --batch --yes --encrypt --recipient "$recipient" --output "$output.tmp"
     else
-        tar -C "$staging" -cpf - manifest.env SHA256SUMS rootfs.oci.tar developer-home.tar.zst container-inspect.json |
-            gpg --symmetric --cipher-algo AES256 --compress-algo none --output "$output.tmp"
+        local -a gpg_passphrase_options=()
+        [[ -z "$passphrase_file" ]] || gpg_passphrase_options=(--batch --pinentry-mode loopback --passphrase-file "$passphrase_file")
+        emit_bundle |
+            gpg "${gpg_passphrase_options[@]}" \
+                --symmetric --cipher-algo AES256 --compress-algo none --output "$output.tmp"
     fi
     mv "$output.tmp" "$output"
     (cd "$(dirname "$output")" && sha256sum "$(basename "$output")" > "$(basename "$output").sha256")
     chmod 600 "$output" "$output.sha256"
+    if [[ "$keep_snapshot" == true ]]; then
+        printf '%s\n' "$image" > "$output.snapshot"
+        chmod 600 "$output.snapshot"
+        SEM_CLEANUP_IMAGE=""
+    fi
+    # Failures still restart the original. Only a successfully encrypted backup
+    # may hand an already-stopped container to a deliberate cutover transaction.
+    [[ "$leave_stopped" != true ]] || SEM_CLEANUP_RESTART=false
     echo "Bundle: $output"
     echo "Checksum: $output.sha256"
 }
@@ -186,12 +254,24 @@ import_bundle() {
     verify_linux_destination "$storage_root"
 
     local staging box image developer_uid developer_gid env_root dest_home dest_mask
-    staging="$(mktemp -d)"
+    # A streamed home must restore on disk, not accidentally fill host tmpfs.
+    sudo -v
+    sudo install -d -o "$USER" -g "$USER" "$storage_root"
+    staging="$(mktemp -d "$storage_root/.sem-import.XXXXXX")"
     SEM_CLEANUP_STAGING="$staging"
     trap cleanup_import EXIT
     trap 'exit 130' INT TERM HUP
     echo "Decrypting bundle..."
-    gpg --decrypt "$bundle" | tar -xpf - -C "$staging"
+    set -o pipefail
+    # -dfc passes old uncompressed outer tar through unchanged; v3 is zstd.
+    gpg --decrypt "$bundle" | zstd -dfc | podman unshare tar --acls --xattrs --same-owner -xpf - -C "$staging"
+    # Old outer archives used the source host UID for these metadata files. Do
+    # not confuse that with container-relative home ownership; normalize ONLY
+    # known staging metadata so the destination Podman owner can read it.
+    local metadata
+    for metadata in manifest.env SHA256SUMS container-inspect.json home-exclusions.txt rootfs.oci.tar rootfs.oci.tar.zst developer-home.tar.zst; do
+        [[ ! -f "$staging/$metadata" || -L "$staging/$metadata" ]] || podman unshare chown 0:0 "$staging/$metadata"
+    done
     [[ -f "$staging/manifest.env" && -f "$staging/SHA256SUMS" ]] || die "invalid transfer bundle"
     (cd "$staging" && sha256sum -c SHA256SUMS)
 
@@ -201,7 +281,7 @@ import_bundle() {
     image="$(sed -n 's/^IMAGE_REF=//p' "$staging/manifest.env")"
     developer_uid="$(sed -n 's/^DEVELOPER_UID=//p' "$staging/manifest.env")"
     developer_gid="$(sed -n 's/^DEVELOPER_GID=//p' "$staging/manifest.env")"
-    [[ "$bundle_version" == "$SUPPORTED_BUNDLE_VERSION" ]] || die "unsupported bundle version: ${bundle_version:-missing}"
+    [[ "$bundle_version" == 1 || "$bundle_version" == 2 || "$bundle_version" == "$SUPPORTED_BUNDLE_VERSION" ]] || die "unsupported bundle version: ${bundle_version:-missing}"
     [[ "$source_box" =~ ^[a-zA-Z0-9_.-]+$ ]] || die "invalid box name in manifest"
     [[ "$image" =~ ^[a-zA-Z0-9_./:-]+$ ]] || die "invalid image reference in manifest"
     [[ "$developer_uid" =~ ^[0-9]+$ && "$developer_gid" =~ ^[0-9]+$ ]] || die "invalid developer ownership in manifest"
@@ -218,12 +298,23 @@ import_bundle() {
     sudo chown "$USER:$USER" "$env_root" "$dest_home" "$dest_mask"
 
     echo "Restoring developer home through the destination Podman user namespace..."
-    zstd -dc "$staging/developer-home.tar.zst" |
-        podman unshare tar --acls --xattrs --same-owner --sparse -xpf - -C "$dest_home"
+    if [[ "$bundle_version" == 3 ]]; then
+        [[ -d "$staging/home" && ! -L "$staging/home" ]] || die 'Streamed developer home is missing.'
+        rmdir -- "$dest_home"
+        podman unshare mv -- "$staging/home" "$dest_home"
+    else
+        zstd -dc "$staging/developer-home.tar.zst" |
+            podman unshare tar --acls --xattrs --same-owner --sparse -xpf - -C "$dest_home"
+    fi
     podman unshare chown "$developer_uid:$developer_gid" "$dest_home"
 
     echo "Loading OCI image..."
-    podman load -i "$staging/rootfs.oci.tar"
+    if [[ "$bundle_version" == 1 ]]; then
+        podman load -i "$staging/rootfs.oci.tar"
+    else
+        set -o pipefail
+        zstd -dc "$staging/rootfs.oci.tar.zst" | podman load
+    fi
     podman image exists "$image" || die "loaded image was not found: $image"
 
     install -m 600 "$staging/manifest.env" "$env_root/import-manifest.env"
@@ -266,7 +357,7 @@ usage() {
 Usage: ./manage-safe-environement.sh migrate <box-name> <destination-root>
 
 Example:
-  ./manage-safe-environement.sh migrate personal /mnt/hdd3/secure-env-manager
+  ./manage-safe-environement.sh migrate personal /mnt/hdd2/secure-env-manager
 
 The script must be run as the regular user that owns the rootless container.
 It will request sudo only to create/chown destination directories. It stops the
@@ -417,7 +508,7 @@ esac
 # CONFIGURATION
 # ==============================================================================
 ACTION="${1:-help}"
-BOX_NAME="$2"
+BOX_NAME="${2:-}"
 
 # ==============================================================================
 # INTERACTIVE INPUT HELPERS
@@ -455,11 +546,22 @@ if [[ -z "$BOX_NAME" && "$ACTION" != "help" ]]; then
     safe_read "🔹 Enter Environment Name (e.g., work-env): " BOX_NAME
 fi
 if [[ -z "$BOX_NAME" ]]; then BOX_NAME="work-env"; fi
+[[ "$BOX_NAME" =~ ^[a-z][a-z0-9_-]{0,21}$ ]] || die 'Environment name must start with a lowercase letter and contain at most 22 lowercase letters, digits, underscores or hyphens.'
+SEM_ALLOW_SHARED_DEVELOPER="${SEM_ALLOW_SHARED_DEVELOPER:-0}"
+[[ "$SEM_ALLOW_SHARED_DEVELOPER" == 0 || "$SEM_ALLOW_SHARED_DEVELOPER" == 1 ]] || die 'SEM_ALLOW_SHARED_DEVELOPER must be 0 or 1.'
+if [[ "${3:-}" == --allow-shared-developer && ( "$ACTION" == setup-docker || "$ACTION" == setup-ssh ) && $# == 3 ]]; then
+    SEM_ALLOW_SHARED_DEVELOPER=1
+elif [[ $# -gt 2 ]]; then
+    die 'Unexpected arguments (use --allow-shared-developer with setup-docker/setup-ssh).'
+fi
+if [[ "$EUID" == 0 && ( "$ACTION" == create || "$ACTION" == recreate || "$ACTION" == setup-docker || "$ACTION" == setup-ssh ) ]]; then
+    die 'Run as the regular rootless Podman owner, without sudo. The manager requests sudo only for host setup.'
+fi
 
 # Storage Configuration
 # Override these to place environments on a dedicated Linux filesystem:
-#   SEM_STORAGE_ROOT=/mnt/hdd3/secure-env-manager/environments
-#   SEM_IMAGE_ROOT=/mnt/hdd3/secure-env-manager/images
+#   SEM_STORAGE_ROOT=/mnt/hdd2/secure-env-manager/environments
+#   SEM_IMAGE_ROOT=/mnt/hdd2/secure-env-manager/images
 # SEM_CONTAINER_IMAGE can point at a migrated/snapshotted container image.
 SEM_STORAGE_ROOT="${SEM_STORAGE_ROOT:-/opt}"
 SEM_IMAGE_ROOT="${SEM_IMAGE_ROOT:-/var/lib}"
@@ -471,8 +573,9 @@ IMG_SIZE="100G"
 
 # User Configuration
 INTERNAL_USER="developer"
-HOST_USER=${SUDO_USER:-$(logname)}
-HOST_HOME=$(eval echo ~"$HOST_USER")
+HOST_USER="${SUDO_USER:-$(id -un)}"
+HOST_HOME="$(getent passwd "$HOST_USER" | cut -d: -f6)"
+[[ "$HOST_HOME" == /* && -d "$HOST_HOME" ]] || die 'Cannot resolve the Podman owner home.'
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ==============================================================================
@@ -480,16 +583,278 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ==============================================================================
 
 function show_help() {
-    echo "Usage: $0 [create|recreate|delete|mount|verify] [env_name]"
+    echo "Usage: $0 [create|recreate|delete|mount|verify|setup-ssh|setup-docker] [env_name]"
     echo "       $0 migrate <env_name> <destination-root>"
     echo "       $0 export <env_name> <bundle.gpg> [--recipient <gpg-id>]"
     echo "       $0 import <bundle.gpg> <storage-root> [new-env-name]"
     echo "       $0 send <bundle.gpg> <ssh-destination>"
-    echo "  create  : Build a new secure environment (SOC2 Compliant)"
+    echo "  create  : Build a development environment with a separate rootless Docker builder"
     echo "  recreate: Rebuild container keeping encrypted storage (Safe Mode)"
     echo "  delete  : Destroy the container and wipe storage (Nuclear Mode)"
     echo "  mount   : Remount the encrypted storage (Run this after reboot)"
     echo "  verify  : Verify host home protection is working correctly"
+    echo "  setup-ssh: Configure key-only, on-demand SSH access for an existing environment"
+    echo "  setup-docker: Provision and select a separate-user rootless Docker builder"
+    echo "  setup-docker/setup-ssh accept --allow-shared-developer when cross-box sharing is intended"
+}
+
+function sem_allocate_ssh_port() {
+    local preferred="${SEM_SSH_PORT:-}" candidate offset
+    local existing="$HOST_HOME/.config/secure-env-manager/ssh/$BOX_NAME.env"
+    if [[ -z "$preferred" && -r "$existing" ]]; then
+        preferred="$(sed -n 's/^SEM_SSH_PORT=//p' "$existing" | head -n 1)"
+    fi
+    if [[ -n "$preferred" ]]; then
+        [[ "$preferred" =~ ^[0-9]+$ && "$preferred" -ge 1024 && "$preferred" -le 65535 ]] || {
+            echo "❌ SEM_SSH_PORT must be between 1024 and 65535." >&2
+            return 1
+        }
+        printf '%s\n' "$preferred"
+        return 0
+    fi
+    offset=$(( $(printf '%s' "$BOX_NAME" | cksum | awk '{print $1}') % 5000 ))
+    candidate=$((22000 + offset))
+    while ss -H -ltn "sport = :$candidate" 2>/dev/null | grep -q .; do
+        candidate=$((candidate + 1))
+        [[ "$candidate" -le 26999 ]] || candidate=22000
+    done
+    printf '%s\n' "$candidate"
+}
+
+function sem_install_ssh_proxy_runtime() {
+    local config_root="$HOST_HOME/.config/secure-env-manager/ssh"
+    local bin_dir="$HOST_HOME/.local/bin"
+    local unit_dir="$HOST_HOME/.config/systemd/user"
+    install -d -m 700 "$config_root" "$bin_dir"
+    install -d -m 755 "$unit_dir"
+    cat > "$bin_dir/sem-ssh-proxy" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+box="${1:-}"
+[[ "$box" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "Invalid secure environment name" >&2; exit 64; }
+# ProxyCommand callers may sanitize or replace the desktop session bus variables.
+# Resolve the rootless Podman owner's real user-systemd bus explicitly.
+runtime_dir="/run/user/$(id -u)"
+export XDG_RUNTIME_DIR="$runtime_dir"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime_dir/bus"
+config="$HOME/.config/secure-env-manager/ssh/$box.env"
+[[ -r "$config" ]] || { echo "No SSH configuration for secure environment '$box'" >&2; exit 69; }
+# shellcheck disable=SC1090
+source "$config"
+[[ "${SEM_BOX_NAME:-}" == "$box" && "${SEM_SSH_PORT:-}" =~ ^[0-9]+$ ]] || {
+  echo "Invalid SSH metadata for '$box'" >&2
+  exit 65
+}
+exec 9>"$HOME/.config/secure-env-manager/ssh/$box.lock"
+flock 9
+# The templated unit is intentionally RemainAfterExit: `start` is a no-op when
+# the container was killed manually. Reconcile the real Podman state first so
+# SSH demand wakes a stopped container instead of waiting on a dead port.
+container_running="$(podman inspect --format '{{.State.Running}}' "$box" 2>/dev/null || true)"
+if [[ "$container_running" != "true" ]]; then
+  systemctl --user restart "sem-container@$box.service"
+  # Refresh readiness against the container that was just started. Keeping the
+  # pre-start false value would make on-demand SSH time out forever.
+  container_running=true
+fi
+for _ in $(seq 1 90); do
+  bridge_mode=''
+  if nc -z 127.0.0.1 "$SEM_SSH_PORT" 2>/dev/null; then
+    bridge_mode=host
+  elif podman inspect --format '{{.State.Running}}' "$box" 2>/dev/null | grep -qx true \
+      && podman exec "$box" nc -z 127.0.0.1 "$SEM_SSH_PORT" 2>/dev/null; then
+    bridge_mode=container
+  fi
+  if [[ -n "$bridge_mode" ]]; then
+    flock -u 9
+    child_pid=''
+    cleanup() {
+      local rc=$?
+      trap - EXIT INT TERM HUP
+      if [[ -n "$child_pid" ]]; then
+        kill "$child_pid" 2>/dev/null || true
+        wait "$child_pid" 2>/dev/null || true
+      fi
+      exit "$rc"
+    }
+    trap cleanup EXIT INT TERM HUP
+    if [[ "$bridge_mode" == host ]]; then
+      nc 127.0.0.1 "$SEM_SSH_PORT" <&0 &
+    else
+      podman exec -i "$box" nc 127.0.0.1 "$SEM_SSH_PORT" <&0 &
+    fi
+    child_pid=$!
+    wait "$child_pid"
+    exit $?
+  fi
+  sleep 1
+done
+echo "Secure environment '$box' started, but SSH did not become ready on port $SEM_SSH_PORT" >&2
+exit 70
+EOF
+    chmod 700 "$bin_dir/sem-ssh-proxy"
+    cat > "$unit_dir/sem-container@.service" <<'EOF'
+[Unit]
+Description=On-demand secure Distrobox environment %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/podman start %i
+ExecStop=/usr/bin/podman stop --time 30 %i
+TimeoutStartSec=120
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target
+EOF
+    systemctl --user daemon-reload
+    # Keep the rootless Podman/systemd user manager available after reboot,
+    # before an interactive desktop login.  The proxy remains on-demand; this
+    # only makes its user bus and container state reliable for jump SSH.
+    if command -v loginctl >/dev/null 2>&1 && [[ "$(loginctl show-user "$HOST_USER" -p Linger --value 2>/dev/null || true)" != yes ]]; then
+        sudo loginctl enable-linger "$HOST_USER"
+    fi
+}
+
+function sem_write_ssh_config_block() {
+    local alias="$1" port="$2" key_file="$3" use_proxy="${4:-yes}" jump_key="${5:-}"
+    local ssh_config="$HOST_HOME/.ssh/config"
+    local known_hosts="$HOST_HOME/.ssh/sem_worker_known_hosts"
+    local begin="# BEGIN secure-env-manager:$BOX_NAME" end="# END secure-env-manager:$BOX_NAME"
+    install -d -m 700 "$HOST_HOME/.ssh"
+    touch "$ssh_config"
+    chmod 600 "$ssh_config"
+    sed -i "/^${begin}$/,/^${end}$/d" "$ssh_config"
+    cat >> "$ssh_config" <<EOF
+$begin
+Host $alias
+    HostName 127.0.0.1
+    Port $port
+    User $INTERNAL_USER
+    IdentityFile $key_file
+    IdentitiesOnly yes
+    StrictHostKeyChecking yes
+    UserKnownHostsFile $known_hosts
+    ConnectTimeout 120
+    ServerAliveInterval 15
+    ServerAliveCountMax 4
+$end
+EOF
+    if [[ "$use_proxy" == yes ]]; then
+        [[ -f "$jump_key" ]] || die 'Missing restricted jump identity; refusing human-host proxy fallback.'
+        sed -i "/^$end/i\    ProxyCommand ssh -T -o BatchMode=yes -o IdentityAgent=none -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o HostKeyAlias=sem-$(hostname -s)-jump -o UserKnownHostsFile=$known_hosts -i $jump_key orca-jump@127.0.0.1 $BOX_NAME" "$ssh_config"
+    fi
+}
+
+function sem_pin_worker_host_keys() {
+    local port="$1" known_hosts="$HOST_HOME/.ssh/sem_worker_known_hosts" inner_key outer_key line
+    inner_key="$(podman exec --user developer "$BOX_NAME" cat /etc/ssh/ssh_host_ed25519_key.pub)"
+    outer_key="$(cat /etc/ssh/ssh_host_ed25519_key.pub)"
+    [[ "$inner_key" == ssh-ed25519\ * && "$outer_key" == ssh-ed25519\ * ]] || die 'Expected trusted local Ed25519 server host keys.'
+    touch "$known_hosts"
+    chmod 600 "$known_hosts"
+    # Do not erase old pins automatically if a container/host key changes.
+    # OpenSSH will reject a conflicting key and require deliberate review.
+    for line in "[127.0.0.1]:$port $inner_key" "sem-$(hostname -s)-jump $outer_key"; do
+        grep -qxF "$line" "$known_hosts" || printf '%s\n' "$line" >> "$known_hosts"
+    done
+}
+
+function setup_ssh_access() {
+    local use_proxy="${1:-yes}"
+    [[ $EUID -ne 0 ]] || {
+        echo "❌ Run setup-ssh as the rootless Podman owner, not with sudo." >&2
+        return 1
+    }
+    podman container exists "$BOX_NAME" || {
+        echo "❌ Container '$BOX_NAME' does not exist." >&2
+        return 1
+    }
+    command -v nc >/dev/null || {
+        echo "❌ Host package 'netcat-openbsd' is required." >&2
+        return 1
+    }
+    local port key_file public_key alias metadata_dir jump_key=''
+    local -a stage_options=()
+    port="$(sem_allocate_ssh_port)"
+    key_file="$HOST_HOME/.ssh/sem_${BOX_NAME}_ed25519"
+    if [[ "$BOX_NAME" == personal && -f "$HOST_HOME/.ssh/orca_personal_ed25519" ]]; then
+        key_file="$HOST_HOME/.ssh/orca_personal_ed25519"
+    fi
+    if [[ ! -f "$key_file" ]]; then
+        ssh-keygen -q -t ed25519 -N '' -C "secure-env-manager:$BOX_NAME" -f "$key_file"
+    fi
+    chmod 600 "$key_file"
+    chmod 644 "$key_file.pub"
+    public_key="$(cat "$key_file.pub")"
+
+    echo "🔐 Installing key-only SSH in '$BOX_NAME' on 127.0.0.1:$port..."
+    if ! distrobox enter "$BOX_NAME" -- sh -lc 'command -v sshd >/dev/null && command -v nc >/dev/null'; then
+        if ! distrobox enter "$BOX_NAME" -- sudo env DEBIAN_FRONTEND=noninteractive apt-get update; then
+            echo "⚠️  A configured package repository failed to update; attempting the cached package indexes." >&2
+        fi
+        if ! distrobox enter "$BOX_NAME" -- sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server netcat-openbsd; then
+            distrobox enter "$BOX_NAME" -- sh -lc 'command -v sshd >/dev/null && command -v nc >/dev/null' || {
+                echo "❌ OpenSSH or netcat installation failed in '$BOX_NAME'." >&2
+                return 1
+            }
+            echo "⚠️  Package configuration reported an unrelated error; SSH dependencies are present, continuing." >&2
+        fi
+    fi
+    distrobox enter "$BOX_NAME" -- sudo install -d -o "$INTERNAL_USER" -g "$INTERNAL_USER" -m 700 "/home/$INTERNAL_USER/.ssh"
+    if ! distrobox enter "$BOX_NAME" -- sudo -u "$INTERNAL_USER" grep -qxF "$public_key" "/home/$INTERNAL_USER/.ssh/authorized_keys" 2>/dev/null; then
+        printf '%s\n' "$public_key" | distrobox enter "$BOX_NAME" -- sudo tee -a "/home/$INTERNAL_USER/.ssh/authorized_keys" >/dev/null
+    fi
+    distrobox enter "$BOX_NAME" -- sudo chown "$INTERNAL_USER:$INTERNAL_USER" "/home/$INTERNAL_USER/.ssh/authorized_keys"
+    distrobox enter "$BOX_NAME" -- sudo chmod 600 "/home/$INTERNAL_USER/.ssh/authorized_keys"
+    distrobox enter "$BOX_NAME" -- sudo tee /etc/ssh/sshd_config.d/90-secure-env-manager.conf >/dev/null <<EOF
+Port $port
+ListenAddress 127.0.0.1
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+AllowUsers $INTERNAL_USER
+X11Forwarding no
+AllowTcpForwarding local
+GatewayPorts no
+EOF
+    distrobox enter "$BOX_NAME" -- sudo ssh-keygen -A
+    distrobox enter "$BOX_NAME" -- sudo systemctl enable ssh >/dev/null
+    if distrobox enter "$BOX_NAME" -- sudo systemctl is-active --quiet ssh; then
+        distrobox enter "$BOX_NAME" -- sudo systemctl reload ssh
+    else
+        distrobox enter "$BOX_NAME" -- sudo systemctl start ssh
+    fi
+
+    metadata_dir="$HOST_HOME/.config/secure-env-manager/ssh"
+    install -d -m 700 "$metadata_dir"
+    cat > "$metadata_dir/$BOX_NAME.env" <<EOF
+SEM_BOX_NAME=$BOX_NAME
+SEM_SSH_PORT=$port
+EOF
+    chmod 600 "$metadata_dir/$BOX_NAME.env"
+    alias="sem-$(hostname -s)-$BOX_NAME"
+    if [[ "$use_proxy" == yes ]]; then
+        jump_key="$HOST_HOME/.ssh/sem_orca_jump_ed25519"
+        if [[ ! -f "$jump_key" ]]; then
+            ssh-keygen -q -t ed25519 -N '' -C 'secure-env-manager:restricted-jump' -f "$jump_key"
+        fi
+        chmod 600 "$jump_key"
+        [[ "$SEM_ALLOW_SHARED_DEVELOPER" == 0 ]] || stage_options+=(--allow-shared-developer)
+        sudo bash "$SCRIPT_DIR/harden-worker-access.sh" stage "$BOX_NAME" "$jump_key.pub" --ssh-port "$port" "${stage_options[@]}"
+    fi
+    sem_pin_worker_host_keys "$port"
+    sem_write_ssh_config_block "$alias" "$port" "$key_file" "$use_proxy" "$jump_key"
+    echo "✅ SSH ready: ssh $alias"
+    if [[ "$use_proxy" == yes ]]; then
+        echo "   Restricted jump: orca-jump (only the approved '$BOX_NAME' transport, no host shell/forwarding)."
+        echo "   Remote ProxyCommand: ssh -T -o IdentitiesOnly=yes -i /path/to/restricted-jump-key orca-jump@$(hostname -s) $BOX_NAME"
+        echo '   Copy/pin the host public key through a trusted channel on the remote client; never distribute the human host key.'
+    fi
 }
 
 function setup_encryption() {
@@ -873,66 +1238,56 @@ EOF
 }
 
 function verify_host_home_protection() {
-    echo "🔍 Verifying container setup: $BOX_NAME"
-    
-    if ! distrobox list | grep -q "$BOX_NAME"; then
-        echo "❌ Container '$BOX_NAME' does not exist."
-        return 1
-    fi
-    
-    # Check host home permissions
-    HOST_HOME_PERMS=$(stat -c "%a" "$HOST_HOME" 2>/dev/null)
-    if [ "$HOST_HOME_PERMS" = "700" ]; then
-        echo "✅ Host home ($HOST_HOME) is protected (chmod 700)"
-    else
-        echo "⚠️  Host home permissions are $HOST_HOME_PERMS (expected 700)"
-    fi
-    
-    # Note: Full verification requires container initialization which happens on first entry
-    # Skip deep verification here - it will be done during provisioning
-    echo "✅ Basic setup verification complete"
-    echo "   (Full verification happens during provisioning)"
-    return 0
+    python3 "$SCRIPT_DIR/worker-access/verify-filesystem.py" "$BOX_NAME" "$HOST_HOME"
+}
+
+function sem_docker_socket_inside() {
+    local scope="$1"
+    [[ "$scope" =~ ^[a-z][a-z0-9_-]{0,21}$ ]] || return 64
+    # Choose the private path even before provisioning: missing builder =
+    # no Docker access, never an implicit fallback to the host-root proxy.
+    printf '/run/host/run/sem-docker/%s/docker.sock\n' "$scope"
 }
 
 function setup_docker_proxy() {
-    echo "🐳 Setting up Host Docker Socket Proxy..."
-    # We must ensure socat is installed on the host
-    if ! command -v socat &>/dev/null; then
-        echo "   Installing socat on host..."
-        sudo apt-get update && sudo apt-get install -y socat
+    SEM_DOCKER_SOCKET_INSIDE="$(sem_docker_socket_inside "$BOX_NAME")"
+    [[ -f "$SCRIPT_DIR/harden-worker-access.sh" ]] || die 'Missing rootless builder installer.'
+    require_commands podman rootlesskit dockerd-rootless.sh dockerd newuidmap newgidmap slirp4netns socat mount findmnt curl
+    if [[ ( "$ACTION" == create || "$ACTION" == recreate ) && -S /tmp/distrobox-docker.sock && ! -L /tmp/distrobox-docker.sock ]]; then
+        die 'A legacy shared Docker proxy still exists. Audit/revoke it deliberately before creating more workers; this command will not stop it or disrupt its workloads. Existing boxes can use additive setup-docker first.'
     fi
+    echo "🐳 Docker will use a separate locked host account at $SEM_DOCKER_SOCKET_INSIDE."
+    echo '   Host-root Docker and shared legacy proxies are not created or modified.'
+}
 
-    local SYSTEMD_USER_DIR="$HOST_HOME/.config/systemd/user"
-    local SERVICE_FILE="$SYSTEMD_USER_DIR/distrobox-docker-proxy.service"
-    
-    # Create directory using host user permissions
-    sudo -u "$HOST_USER" mkdir -p "$SYSTEMD_USER_DIR"
-    
-    # Create systemd service
-    cat << EOF | sudo -u "$HOST_USER" tee "$SERVICE_FILE" >/dev/null
-[Unit]
-Description=Distrobox Docker Socket Proxy
-
-[Service]
-ExecStart=/usr/bin/socat UNIX-LISTEN:/tmp/distrobox-docker.sock,fork,mode=0666 UNIX-CONNECT:/var/run/docker.sock
-Restart=always
-
-[Install]
-WantedBy=default.target
-EOF
-
-    # Reload and enable the service as the host user
-    sudo -u "$HOST_USER" XDG_RUNTIME_DIR="/run/user/$(id -u $HOST_USER)" systemctl --user daemon-reload
-    sudo -u "$HOST_USER" XDG_RUNTIME_DIR="/run/user/$(id -u $HOST_USER)" systemctl --user enable --now distrobox-docker-proxy.service
-    
-    # Wait briefly for socket to appear
-    sleep 1
-    if [ ! -S "/tmp/distrobox-docker.sock" ]; then
-        echo "⚠️ Docker proxy socket not created. Is docker running on the host?"
-    else
-        echo "✅ Host Docker proxy ready at /tmp/distrobox-docker.sock"
-    fi
+function sem_setup_rootless_docker() {
+    local -a builder_options=()
+    [[ "$SEM_ALLOW_SHARED_DEVELOPER" == 0 ]] || builder_options+=(--allow-shared-developer)
+    setup_docker_proxy
+    sudo bash "$SCRIPT_DIR/harden-worker-access.sh" docker "$BOX_NAME" "${builder_options[@]}" || return $?
+    # Check the developer/client permission path, not only the daemon-owner API.
+    podman exec --user developer "$BOX_NAME" curl --fail --silent --show-error --max-time 5 \
+        --unix-socket "$SEM_DOCKER_SOCKET_INSIDE" http://localhost/_ping | grep -qx OK || die 'Developer cannot reach private Docker; profiles were not switched.'
+    podman exec --user developer --env "DOCKER_HOST=unix://$SEM_DOCKER_SOCKET_INSIDE" "$BOX_NAME" \
+        docker info --format '{{json .SecurityOptions}}' | grep -q 'name=rootless' || die 'Selected Docker daemon is not rootless; profiles were not switched.'
+    printf 'export DOCKER_HOST=%q\n' "unix://$SEM_DOCKER_SOCKET_INSIDE" | \
+        distrobox enter "$BOX_NAME" -- sudo tee /etc/profile.d/docker-host.sh >/dev/null
+    distrobox enter "$BOX_NAME" -- sudo chmod 644 /etc/profile.d/docker-host.sh
+    distrobox enter "$BOX_NAME" -- sudo sh -c '
+        developer_uid=$(id -u developer)
+        line="if [ \"\$EUID\" = $developer_uid ] && [ -r /etc/profile.d/docker-host.sh ]; then . /etc/profile.d/docker-host.sh; fi"
+        for file in /etc/zsh/zshenv /etc/zshenv; do
+            [ -f "$file" ] || continue
+            grep -qxF "$line" "$file" || sed -i "1i$line" "$file"
+        done'
+    distrobox enter "$BOX_NAME" -- sudo -H -u developer sh -c '
+        for file in "$HOME/.zshenv" "$HOME/.bashrc"; do
+            touch "$file"
+            line="[ ! -r /etc/profile.d/docker-host.sh ] || . /etc/profile.d/docker-host.sh"
+            grep -qxF "$line" "$file" || sed -i "1i$line" "$file"
+        done'
+    echo '✅ Private rootless Docker selected. Existing shells retain their exports until reopened.'
+    echo '   Old rootful socket/proxy access is NOT automatically revoked; audit it separately before cloud connection.'
 }
 
 function install_bridge() {
@@ -940,6 +1295,16 @@ function install_bridge() {
     
     # Install socat for audio socket proxying and ALSA plugins for PulseAudio redirect
     distrobox enter "$BOX_NAME" -- sudo apt-get install -y socat pulseaudio-utils libasound2-plugins > /dev/null 2>&1 || true
+    # Transfer the single audio authentication cookie from the trusted host-side
+    # installer. Never bind the host home merely so an in-container bridge can
+    # retrieve it. Existing developer cookies are left unchanged when absent.
+    if [[ -f "$HOST_HOME/.config/pulse/cookie" ]]; then
+        distrobox enter "$BOX_NAME" -- sudo install -d -m 700 -o developer -g developer /home/developer/.config/pulse
+        podman exec -i --user 0 "$BOX_NAME" sh -c '
+            umask 077; tee /home/developer/.config/pulse/cookie >/dev/null
+            chown developer:developer /home/developer/.config/pulse/cookie
+        ' < "$HOST_HOME/.config/pulse/cookie"
+    fi
     
     cat << 'EOF' | distrobox enter "$BOX_NAME" -- sudo tee /usr/local/bin/run-as-dev > /dev/null
 #!/bin/bash
@@ -978,14 +1343,7 @@ if command -v socat &>/dev/null; then
     sleep 0.5
 fi
 
-# 2. COPY PULSE COOKIE FOR AUTHENTICATION  
-HOST_USER_NAME=$(getent passwd "$HOST_UID" 2>/dev/null | cut -d: -f1 || echo "")
-if [ -n "$HOST_USER_NAME" ] && [ -f "/run/host/home/$HOST_USER_NAME/.config/pulse/cookie" ]; then
-    sudo mkdir -p "$DEVELOPER_HOME/.config/pulse"
-    sudo cp "/run/host/home/$HOST_USER_NAME/.config/pulse/cookie" "$DEVELOPER_HOME/.config/pulse/cookie" 2>/dev/null || true
-    sudo chown -R developer:developer "$DEVELOPER_HOME/.config/pulse" 2>/dev/null || true
-    sudo chmod 600 "$DEVELOPER_HOME/.config/pulse/cookie" 2>/dev/null || true
-fi
+# 2. The trusted installer transferred the pulse cookie into the isolated home.
 
 # 3. GENERATE MACHINE ID
 if [ ! -f /var/lib/dbus/machine-id ]; then
@@ -1074,7 +1432,25 @@ EOF
 # MAIN LOGIC
 # ==============================================================================
 
-if [ "$ACTION" == "verify" ]; then
+if [ "$ACTION" == "help" ]; then
+    show_help
+    exit 0
+
+elif [ "$ACTION" == "setup-docker" ]; then
+    sem_setup_rootless_docker
+    exit $?
+
+elif [ "$ACTION" == "setup-ssh" ]; then
+    SETUP_JUMP_PROXY=""
+    safe_read "   Set up jump-proxy/on-demand startup too? (Y/n): " SETUP_JUMP_PROXY
+    if [[ "$SETUP_JUMP_PROXY" =~ ^[Nn]$ ]]; then
+        setup_ssh_access no
+    else
+        setup_ssh_access yes
+    fi
+    exit $?
+
+elif [ "$ACTION" == "verify" ]; then
     if [[ -z "$BOX_NAME" ]]; then
         echo "❌ Error: Environment name required for verify action"
         show_help
@@ -1142,7 +1518,8 @@ elif [[ "$ACTION" == "create" || "$ACTION" == "recreate" ]]; then
     fi
     echo ""
     
-    # Ensure background proxies are running
+    # Check prerequisites/select the private path; create the builder only
+    # after provisioning establishes the real developer namespace identity.
     setup_docker_proxy
     echo ""
 
@@ -1153,16 +1530,9 @@ elif [[ "$ACTION" == "create" || "$ACTION" == "recreate" ]]; then
     echo ""
     
     # --- AUTO-CLEANUP CHECK ---
-    if distrobox list | grep -q "$BOX_NAME"; then
+    if podman container exists "$BOX_NAME"; then
         if [ "$ACTION" == "create" ]; then
-            echo "⚠️  Container '$BOX_NAME' already exists."
-            echo "   To apply all fixes, it must be recreated."
-            safe_read "   Wipe entirely and recreate (WARNING: LOSES DATA)? (y/n): " DO_RECREATE
-            if [[ "$DO_RECREATE" =~ ^[Yy]$ ]]; then
-                $0 delete "$BOX_NAME"
-            else
-                echo "   Skipping creation. Configuration may be incomplete."
-            fi
+            die "Container '$BOX_NAME' already exists. Use setup-docker for additive setup, or deliberately use recreate during maintenance. Nothing was stopped or reprovisioned."
         elif [ "$ACTION" == "recreate" ]; then
             echo "🛑 Stopping old container for safe recreation..."
             distrobox stop "$BOX_NAME" --yes || true
@@ -1216,30 +1586,15 @@ elif [[ "$ACTION" == "create" || "$ACTION" == "recreate" ]]; then
         fi
     fi
     
-    if ! distrobox list | grep -q "$BOX_NAME"; then
-        # --- CRITICAL FIX: MASK HOST HOME DIRECTORY TO PREVENT DATA LOSS ---
-        # Distrobox by default mounts the host's home directory inside the container.
-        # The --home flag only changes $HOME env var, it does NOT prevent the host home mount.
-        # 
-        # Strategy:
-        # 1. Use --mount type=tmpfs to create an empty tmpfs filesystem OVER /home/$HOST_USER
-        #    This effectively masks the real host home with an empty temporary filesystem
-        # 2. --volume mounts isolated storage for the developer user at /home/$INTERNAL_USER
-        # 3. --home sets $HOME to the developer's isolated folder
-        # 4. --security-opt no-new-privileges prevents privilege escalation via setuid binaries
-        #
-        # SECURITY MODEL:
-        # - Container's /home/$HOST_USER is an empty tmpfs (real host home is hidden)
-        # - Container user has isolated persistent home at /home/$INTERNAL_USER
-        # - Real host home is NEVER accessible inside the container
-        # - Developer user has NO sudo access (removed from sudo group)
-        # - no-new-privileges prevents setuid/capability escalation
-        # - Admin tasks: use 'distrobox enter $BOX -- sudo <cmd>' (uses HOST sudo)
+    if ! podman container exists "$BOX_NAME"; then
+        # Distrobox --home is not a security mask. Filter its automatically added
+        # host-root/home/tmp mounts before Podman sees them. Preserve the existing
+        # device/capability/desktop-integration policy rather than silently reducing it.
         
         echo "🛡️  Setting up host home protection..."
-        echo "   Host home: $HOST_HOME (will be masked with empty folder)"
+        echo "   Host home: $HOST_HOME (will NOT be mounted)"
         echo "   Container user home: $WORK_DIR/home → /home/$INTERNAL_USER"
-        echo "   Security: no-new-privileges enabled, developer has no sudo"
+        echo "   Security: explicit filesystem mounts; developer has no sudo"
         
         # Note: $WORK_DIR/home and $WORK_DIR/host_mask are already created by setup_encryption
         # Just verify they exist
@@ -1248,18 +1603,9 @@ elif [[ "$ACTION" == "create" || "$ACTION" == "recreate" ]]; then
             exit 1
         fi
         
-        # MOUNT STRATEGY:
-        # 1. --home "$WORK_DIR/host_mask" tells distrobox to mount our EMPTY folder
-        #    to /home/$HOST_USER INSTEAD of the real host home. This masks it.
-        # 2. --volume provides persistent storage at /home/$INTERNAL_USER for developer
-        # 3. NO tmpfs needed - the --home redirect already provides the masking
-        #
-        # Result: /home/$HOST_USER = empty folder (host_mask), /home/developer = isolated storage
-        #
-        # SECURITY MODEL:
-        # - Developer user has NO sudo group membership (can't sudo inside container)
-        # - Host home is set to 700 (owner-only) - developer user can't access it
-        # - This is safe: owner can still access on host, only "others" are blocked
+        # host_mask is only the container's administrative user's private home.
+        # worker-access/sem-podman removes the actual host home and /run/host root
+        # bind mounts, and adds narrow GUI/audio/Docker integration endpoints.
         
         # Build device list based on available hardware
         DEVICES=""
@@ -1296,7 +1642,8 @@ elif [[ "$ACTION" == "create" || "$ACTION" == "recreate" ]]; then
         
         # SECURITY NOTE: We cannot use --security-opt=no-new-privileges:true because
         # distrobox requires sudo inside the container for provisioning and package installation.
-        # Security is maintained through: capability dropping, namespace isolation, and host home masking.
+        # This filesystem boundary is not a complete hostile-code sandbox; desktop
+        # hardware access, capabilities and integration remain deliberately enabled.
         #
         # NOTE: Removed --unshare-devsys as it prevents access to audio/video devices
         # Device access is controlled explicitly via --device flags instead
@@ -1310,6 +1657,16 @@ elif [[ "$ACTION" == "create" || "$ACTION" == "recreate" ]]; then
         fi
         echo "   Container hostname: $CONTAINER_HOSTNAME"
 
+        require_commands python3
+        # Reserve the scoped socket DIRECTORY before creation; the separate
+        # builder cannot be provisioned until developer's mapping exists. Binding
+        # the directory (not its first socket inode) also survives daemon restarts.
+        if [[ ! -d "/run/sem-docker/$BOX_NAME" ]]; then
+            sudo install -d -m 0755 "/run/sem-docker/$BOX_NAME"
+        fi
+        SEM_HOST_HOME="$HOST_HOME" SEM_ISOLATED_HOME="$WORK_DIR/home" \
+        SEM_MASK_HOME="$WORK_DIR/host_mask" SEM_SCOPE="$BOX_NAME" SEM_HOST_UID="$(id -u)" \
+        PATH="$SCRIPT_DIR/worker-access/podman-bin:$PATH" DBX_CONTAINER_MANAGER=podman \
         distrobox create --name "$BOX_NAME" \
             --image "$SEM_CONTAINER_IMAGE" \
             --hostname "$CONTAINER_HOSTNAME" \
@@ -1317,15 +1674,9 @@ elif [[ "$ACTION" == "create" || "$ACTION" == "recreate" ]]; then
             --home "$WORK_DIR/host_mask" \
             --unshare-process \
             $UNSHARE_NET_FLAG \
-            --init-hooks "rm -f /var/run/docker.sock 2>/dev/null; ln -s /run/host/tmp/distrobox-docker.sock /var/run/docker.sock" \
+            --init-hooks "rm -f /var/run/docker.sock 2>/dev/null; ln -s '$SEM_DOCKER_SOCKET_INSIDE' /var/run/docker.sock" \
             --additional-flags "--privileged=false --ipc=private --shm-size=4g --cap-drop=ALL --cap-add=SYS_ADMIN --cap-add=SYS_PTRACE --cap-add=SETUID --cap-add=SETGID --cap-add=CHOWN --cap-add=DAC_OVERRIDE --cap-add=FOWNER --cap-add=FSETID --cap-add=KILL --cap-add=NET_BIND_SERVICE --cap-add=SETFCAP --cap-add=SETPCAP --cap-add=SYS_CHROOT --cap-add=NET_ADMIN --device /dev/net/tun $DEVICES $AUDIO_MOUNTS --volume /tmp/.X11-unix:/tmp/.X11-unix:ro" \
             --init --yes
-        
-        # PROTECT HOST HOME: Set to 700 so only owner can access
-        # This blocks the developer user (different UID) inside the container
-        # Safe because: owner keeps full access, sudo still works, only "others" blocked
-        echo "🔒 Setting host home to owner-only access (chmod 700)..."
-        chmod 700 "$HOST_HOME"
         
         # Verify protection after creation
         verify_host_home_protection
@@ -1342,17 +1693,7 @@ elif [[ "$ACTION" == "create" || "$ACTION" == "recreate" ]]; then
 set -e
 export DEBIAN_FRONTEND=noninteractive
 
-# --- 1. APPARMOR CONFIGURATION (Permissive Mode) ---
-# Instead of disabling AppArmor entirely, we configure it in complain mode
-# This logs violations without blocking, providing security visibility
-echo ">>> Configuring AppArmor in complain mode..."
-if command -v aa-complain >/dev/null 2>&1; then
-    # Set all profiles to complain mode (log but don't enforce)
-    aa-complain /etc/apparmor.d/* 2>/dev/null || true
-else
-    # If aa-complain not available, create a permissive wrapper that logs
-    echo "AppArmor tools not available, skipping profile configuration"
-fi
+# Never weaken AppArmor profiles during package provisioning.
 
 echo ">>> Installing System & Compliance Packages..."
 apt-get update && apt-get install -y curl git zsh wget unzip build-essential sudo \
@@ -1398,18 +1739,33 @@ echo 'Unattended-Upgrade::Allowed-Origins { "${distro_id}:${distro_codename}"; "
 service unattended-upgrades start || true
 
 # Set up global Docker connection for all users in container
-echo 'export DOCKER_HOST="unix:///run/host/tmp/distrobox-docker.sock"' > /etc/profile.d/docker-host.sh
+printf 'export DOCKER_HOST=%q\n' "unix://$SEM_DOCKER_SOCKET_INSIDE" > /etc/profile.d/docker-host.sh
 chmod 644 /etc/profile.d/docker-host.sh
 
 INTERNAL_USER="developer"
 
 # SECURITY: Create developer user WITHOUT sudo or docker access
-# - No sudo: prevents bypassing the tmpfs mask over host home
+# - No sudo: separates developer execution from administrative provisioning
 # - No docker: docker group grants root-equivalent access (HSV-003)
 # For admin tasks, use: distrobox enter $BOX_NAME -- sudo <command>
 # (which uses the host user's sudo, not container sudo)
 if ! id "$INTERNAL_USER" &>/dev/null; then 
     useradd -m -s /usr/bin/zsh -G audio,video,plugdev "$INTERNAL_USER"
+fi
+# Imported images can retain old administrative group memberships. Apply the
+# same developer policy to them; do not silently preserve root-Docker/sudo grants.
+for unsafe_group in sudo wheel docker hostdocker; do
+    if getent group "$unsafe_group" >/dev/null; then
+        if [[ "$(id -g "$INTERNAL_USER")" == "$(getent group "$unsafe_group" | cut -d: -f3)" ]]; then
+            echo 'ERROR: developer has an administrative primary group; review the imported image identity.' >&2
+            exit 1
+        fi
+        gpasswd -d "$INTERNAL_USER" "$unsafe_group" >/dev/null 2>&1 || true
+    fi
+done
+if [[ "$(id -u "$INTERNAL_USER")" == 0 ]] || sudo -l -U "$INTERNAL_USER" >/dev/null 2>&1; then
+    echo 'ERROR: developer still has administrative sudo access; review image sudoers before continuing.' >&2
+    exit 1
 fi
 
 # --- FIX: FORCE ZSH DEFAULT ---
@@ -1438,7 +1794,9 @@ EOF
     
     cat "$ROOT_SCRIPT" | distrobox enter "$BOX_NAME" -- sudo tee /tmp/root.sh > /dev/null
     distrobox enter "$BOX_NAME" -- sudo chmod +x /tmp/root.sh
-    distrobox enter "$BOX_NAME" -- sudo /bin/bash /tmp/root.sh
+    distrobox enter "$BOX_NAME" -- sudo env "SEM_DOCKER_SOCKET_INSIDE=$SEM_DOCKER_SOCKET_INSIDE" /bin/bash /tmp/root.sh
+    # Developer now exists; verify its mappings and provision separate Docker.
+    sem_setup_rootless_docker
     
     # --- PASSWORD FIX: PIPE TO AVOID SHELL INTERPOLATION ---
     echo "$INTERNAL_USER:$USER_PASS" | distrobox enter "$BOX_NAME" -- sudo chpasswd
@@ -1460,7 +1818,7 @@ cd "$HOME"
     echo 'export XDG_CONFIG_HOME="$HOME/.config"'
     echo 'export XDG_DATA_HOME="$HOME/.local/share"'
     echo 'export XDG_CACHE_HOME="$HOME/.cache"'
-    echo 'export DOCKER_HOST="unix:///run/host/tmp/distrobox-docker.sock"'
+    echo '[ ! -r /etc/profile.d/docker-host.sh ] || . /etc/profile.d/docker-host.sh'
     echo '[ -z "$ZSH_VERSION" ] && exec /usr/bin/zsh -l'
 } >> "$HOME/.bashrc"
 
@@ -1585,6 +1943,17 @@ EOF
         echo ""
         echo "🎉 SUCCESS! Secure Environment '$BOX_NAME' created."
         echo "💡 Next step: Run './setup-apps.sh $BOX_NAME' to install applications and launchers."
+        SETUP_SSH=""
+        safe_read "   Set up key-only SSH access? (Y/n): " SETUP_SSH
+        if [[ ! "$SETUP_SSH" =~ ^[Nn]$ ]]; then
+            SETUP_JUMP_PROXY=""
+            safe_read "   Set up jump-proxy SSH with on-demand container startup? (Y/n): " SETUP_JUMP_PROXY
+            if [[ "$SETUP_JUMP_PROXY" =~ ^[Nn]$ ]]; then
+                setup_ssh_access no
+            else
+                setup_ssh_access yes
+            fi
+        fi
         if [ "$ENCRYPTION_ENABLED" -eq 0 ]; then
             echo "🔒 ENCRYPTION ACTIVE: You must run './manage-safe-environement.sh mount $BOX_NAME' after any reboot."
         fi

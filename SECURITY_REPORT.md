@@ -1,5 +1,11 @@
 # 🔐 Security Vulnerability Report: Distrobox Isolated Environment
 
+> Historical report, not a current security approval. The 2026-10-03 live audit
+> found broader capabilities/host mounts on desktop and privileged containers
+> plus a reachable host-root Docker proxy on notebook. The “all resolved” and
+> “acceptable” labels below must not be used to approve cloud-worker access.
+> See [current controls, validation and remaining risks](docs/worker-access.md).
+
 **Report Date:** December 22, 2025  
 **Version:** 2.0 (Post-Remediation)  
 **Scope:** `manage-safe-environement.sh` and `setup-apps.sh`  

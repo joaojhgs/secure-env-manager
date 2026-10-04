@@ -1,0 +1,8 @@
+services:
+  probe:
+    image: ${SEM_TEST_IMAGE:-sem-worker-access-test:20261003}
+    labels:
+      sem.worker-access-test: "true"
+    volumes:
+      - ${SEM_TEST_ROOT:?test root required}:/work
+    command: ["/bin/sh", "-ec", "cat /work/private-input; umask 077; printf 'compose bind write passed\n' > /work/compose-result"]

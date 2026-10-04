@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""Distrobox's Podman adapter: preserve integration, remove ambient host mounts.
+
+Only create commands are filtered. Capabilities, devices, namespaces, networking
+and Distrobox's entrypoint are intentionally left exactly as requested.
+"""
+import glob
+import os
+from pathlib import Path
+import re
+import sys
+
+
+def integration_mounts(scope, uid):
+    mounts = []
+    # Public configuration and visual assets, not entire /etc, /usr or /var.
+    for source in ("/etc/os-release", "/etc/host.conf", "/etc/localtime",
+                   "/usr/share/themes", "/usr/share/icons", "/usr/share/fonts",
+                   "/run/udev", "/tmp/.X11-unix"):
+        if os.path.exists(source):
+            mounts.append(f"{os.path.realpath(source)}:/run/host{source}:ro,rslave")
+    # These remain narrow integration endpoints; never expose the whole runtime
+    # directory (which also contains host SSH/GPG agents and administrative APIs).
+    runtime = f"/run/user/{uid}"
+    sockets = [f"{runtime}/pulse", f"{runtime}/pipewire-0"]
+    sockets += glob.glob(f"{runtime}/wayland-*")
+    for source in sockets:
+        if os.path.exists(source) and not source.endswith(".lock"):
+            mounts.append(f"{source}:/run/host{source}:rw,rslave")
+    private_docker = f"/run/sem-docker/{scope}"
+    if os.path.isdir(private_docker):
+        mounts.append(f"{private_docker}:/run/host{private_docker}:rw,rslave")
+    return mounts
+
+
+def filter_create(args, home, isolated_home, mask, scope, uid):
+    """Filter only engine mount options, never arguments after --entrypoint/image."""
+    if not re.fullmatch(r"[a-z][a-z0-9_-]{0,21}", scope):
+        raise ValueError("Invalid environment name")
+    home, isolated_home, mask = map(os.path.realpath, (home, isolated_home, mask))
+    allowed = {isolated_home, mask, "/dev", "/sys", "/dev/null",
+               "/tmp/.X11-unix", "/etc/hosts", "/etc/hostname", "/etc/resolv.conf",
+               "/usr/bin/distrobox-init", "/usr/bin/distrobox-export",
+               "/usr/bin/distrobox-host-exec"}
+    # The manager already explicitly requests these display/audio mounts.
+    allowed.update({f"/run/user/{uid}/pulse", f"/run/user/{uid}/pipewire-0"})
+    out = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--entrypoint" or arg.startswith("--entrypoint="):
+            out.extend(args[i:])
+            break
+        value = None
+        if arg in ("--volume", "-v"):
+            if i + 1 == len(args):
+                raise ValueError("Missing volume value")
+            value = args[i + 1]
+            i += 2
+        elif arg.startswith(("--volume=", "-v=")):
+            value = arg.split("=", 1)[1]
+            i += 1
+        elif arg == "--mount" or arg.startswith("--mount="):
+            # Distrobox uses --mount only for private tmpfs. Reject alternative
+            # bind syntax rather than silently allowing a host-filesystem bypass.
+            value_mount = args[i + 1] if arg == "--mount" else arg.split("=", 1)[1]
+            if not value_mount.startswith("type=tmpfs,"):
+                raise ValueError("Only private tmpfs --mount options are allowed")
+            out.extend(["--mount", value_mount])
+            i += 2 if arg == "--mount" else 1
+            continue
+        else:
+            if arg.startswith("--volumes-from"):
+                raise ValueError("Inherited container mounts are not allowed")
+            out.append(arg)
+            i += 1
+            continue
+        fields = value.split(":")
+        if len(fields) == 1:
+            if value not in ("/dev/pts", "/var/log/journal", "/sys/fs/selinux"):
+                raise ValueError(f"Unexpected anonymous volume: {value}")
+            out.extend(["--volume", value])
+            continue
+        source, destination = fields[:2]
+        # During a data-preserving replacement, retain only the original anonymous
+        # journal/PTY volumes. These are Podman volumes, not ambient host binds.
+        if re.fullmatch(r"[0-9a-f]{64}", source) and destination in ("/dev/pts", "/var/log/journal"):
+            out.extend(["--volume", value])
+            continue
+        source = os.path.realpath(source)
+        if source in ("/", home, "/home", "/tmp", f"/run/user/{uid}"):
+            continue
+        if source not in {os.path.realpath(p) for p in allowed}:
+            raise ValueError(f"Unapproved host bind mount: {source} -> {destination}")
+        out.extend(["--volume", value])
+    # Insert before entrypoint: everything following the image belongs to init.
+    insertion = next((i for i, a in enumerate(out)
+                      if a == "--entrypoint" or a.startswith("--entrypoint=")), len(out))
+    extras = ["--label", "sem.host-filesystem=allowlist-v1"]
+    for value in integration_mounts(scope, uid):
+        extras.extend(["--volume", value])
+    out[insertion:insertion] = extras
+    return out
+
+
+def main():
+    args = sys.argv[1:]
+    if "create" in args:
+        try:
+            args = filter_create(args, os.environ["SEM_HOST_HOME"],
+                                 os.environ["SEM_ISOLATED_HOME"],
+                                 os.environ["SEM_MASK_HOME"],
+                                 os.environ["SEM_SCOPE"], os.environ["SEM_HOST_UID"])
+        except (KeyError, ValueError, IndexError) as exc:
+            print(f"SEM mount policy refused creation: {exc}", file=sys.stderr)
+            return 65
+    os.execv("/usr/bin/podman", ["podman", *args])
+
+
+if __name__ == "__main__":
+    sys.exit(main())
