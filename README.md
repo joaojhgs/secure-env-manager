@@ -70,7 +70,8 @@ source data:
 ### Transfer between computers
 
 Create a password-encrypted portable bundle containing the OCI root filesystem,
-the isolated developer home, container metadata, and checksums:
+both isolated homes (developer and administrative compatibility home), persistent
+named-volume data, container metadata, and checksums:
 
 ```bash
 ./manage-safe-environement.sh export personal /mnt/backup/personal.sem.tar.gpg
@@ -91,6 +92,10 @@ relative to the developer home, stored in the encrypted bundle for transparency.
 `--stream-home` uses version 3 to stream/compress/encrypt the home directly,
 avoiding a second full home archive in staging. Import accepts all three versions
 and restores on the selected Linux filesystem, not host tmpfs.
+Persistent volume contents are restored under `imported-volumes/`, with their
+original mount definitions; attach these deliberately when reconstructing the
+container. Kernel terminal filesystems are not archived. Import does not start
+a replacement or overwrite existing storage.
 Private
 agent credentials may be present in the developer home, so unencrypted portable
 bundles are intentionally unsupported. Import preserves container-relative file
@@ -104,6 +109,12 @@ This will:
 - Set up the `developer` user with isolated home
 - Generate environment-specific SSH keys
 - Install the permission bridge for GUI apps
+
+GPU creation also installs device-only ACLs for the verified host-mapped
+developer UID, including a persistent udev rule. Binding `/dev/dri` alone is
+not sufficient for rootless developer sessions. Existing environments can use
+`sudo bash worker-access/enable-gpu-access.sh personal "$USER"`; this does not
+grant host-file access, make GPUs world-writable, or change container privileges.
 
 Creation automatically provisions a locked `sem-build-<environment>` host user,
 private rootless Docker storage/socket and a private ID-mapped workspace view.

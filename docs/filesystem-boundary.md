@@ -39,6 +39,14 @@ backup **and** compressed staging/snapshot. Keep the recovery key protected and
 outside the developer home; do not send it to an agent controller.
 Pause automatic SSH/on-demand container-start probes during the offline export
 and its verification/cutover; they must not restart the source during archiving.
+One rootless alternative is a temporary offline name: rename `personal` to
+`personal-offline` before export, so existing on-demand connectors cannot start
+it by its usual name. Check for connector implementations using stored IDs first.
+On failure rename the original back and start it. After successful export use
+`restrict-filesystem.py personal-offline ... --target-name personal --apply`.
+The policy still uses `personal` for the private Docker socket and integrations,
+and retains the stopped original for rollback. Restore that package with the
+explicit destination name `personal`, not its temporary offline name.
 
 ```sh
 # recovery.key must already exist, owned by the Podman owner, mode 0600.
@@ -53,6 +61,10 @@ python3 worker-access/restrict-filesystem.py personal /safe/path/personal.sem.gp
 
 The export stops ONLY the selected container for a consistent snapshot. Failure
 automatically restarts it. Only successful `--leave-stopped` hands off cutover.
+The recovery package includes the installed OCI image, both persistent homes,
+named-volume data (excluding kernel PTY state), original definition and checksums.
+The in-place migration does NOT restore/extract these homes: it keeps their
+existing bind mounts. The package is for disaster recovery, not routine cutover.
 The replacement reuses the snapshotted installed system, original isolated-home
 bind, existing journal/PTY volumes and original engine creation flags. It refuses
 unexpected changes to privilege, capabilities, device configuration, shared
@@ -62,6 +74,10 @@ timestamped rollback name; no homes, images, volumes or worktrees are pruned.
 Before declaring completion, check root/developer filesystem boundaries, SSH
 PTYS/SFTP, private rootless Docker build/Compose/0600 bind ownership, and baseline
 X11/hardware GPU/audio/video integration. Keep the rollback until these pass.
+Check GPU access as `developer`, not container root, and require a physical GPU
+from Vulkan/OpenGL rather than accepting CPU `llvmpipe`. For an existing mapped
+identity, the host `enable-gpu-access.sh` helper grants only DRM-node access and
+backs up the original ACLs; it never broadens filesystem permissions or privileges.
 Original sessions cannot survive replacing a container; host Orca/VNC and other
 environments must not be restarted as part of this operation.
 

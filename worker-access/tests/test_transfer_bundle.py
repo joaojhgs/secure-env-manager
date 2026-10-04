@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise real tar/zstd/GPG backup paths with fake engines; never stop a real box."""
 import hashlib
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -30,6 +31,13 @@ class TransferBundleTest(unittest.TestCase):
             (home / "source-link").symlink_to("./source.txt")
             os.link(home / "source.txt", home / "source-hardlink")
             (home / "cache.bin").write_text("synthetic excluded cache\n")
+            mask = root / "host_mask"
+            mask.mkdir()
+            (mask / "administrative-config").write_text("synthetic preserved compatibility settings\n")
+            (mask / "administrative-config").chmod(0o600)
+            volume = root / "journal-data"
+            volume.mkdir()
+            (volume / "persistent-state").write_text("synthetic persistent volume contents\n")
             (tools / "podman").write_text('''#!/bin/bash
 set -e
 printf '%s\\n' "$*" >> "$SEM_TEST_LOG"
@@ -38,7 +46,7 @@ case "$1" in
  inspect)
   if [[ "$*" == *State.Running* ]]; then echo true
   elif [[ "$*" == *Source* ]]; then echo "$SEM_TEST_HOME"
-  else echo '[{"Name":"fixture"}]'; fi ;;
+  else printf '%s\\n' "$SEM_TEST_INSPECT_JSON"; fi ;;
  unshare) shift; exec "$@" ;;
  commit) echo synthetic-image ;;
  save) printf 'synthetic OCI bytes\\n' ;;
@@ -59,6 +67,10 @@ esac
             exclusions.write_text("./cache.bin\n")
             env = dict(os.environ, PATH=str(tools) + ":" + os.environ["PATH"],
                        SEM_TEST_LOG=str(root / "calls"), SEM_TEST_HOME=str(home),
+                       SEM_TEST_INSPECT_JSON=json.dumps([{"Name": "fixture", "Mounts": [
+                           {"Type": "bind", "Source": str(home), "Destination": "/home/developer"},
+                           {"Type": "bind", "Source": str(mask), "Destination": "/private/host_mask"},
+                           {"Type": "volume", "Source": str(volume), "Destination": "/var/log/journal", "Name": "fixture-volume"}]}]),
                        GNUPGHOME=str(root / "gpg"))
             (root / "gpg").mkdir(mode=0o700)
             bundle = root / "fixture.gpg"
@@ -88,6 +100,16 @@ esac
             subprocess.run(["sha256sum", "-c", "SHA256SUMS"], cwd=unpack, check=True, capture_output=True)
             decoded = subprocess.check_output(["zstd", "-dc", str(unpack / "rootfs.oci.tar.zst")])
             self.assertEqual(decoded, b"synthetic OCI bytes\n")
+            for filename, member, expected in [
+                ("administrative-home.tar.zst", "./administrative-config", (mask / "administrative-config").read_bytes()),
+                ("persistent-volume-0.tar.zst", "./persistent-state", (volume / "persistent-state").read_bytes()),
+            ]:
+                decoded_tar = root / "auxiliary.tar"
+                decoded_tar.write_bytes(subprocess.check_output(["zstd", "-dc", str(unpack / filename)]))
+                with tarfile.open(decoded_tar) as auxiliary:
+                    self.assertEqual(auxiliary.extractfile(member).read(), expected)
+                    if filename == "administrative-home.tar.zst":
+                        self.assertEqual(auxiliary.getmember(member).mode, 0o600)
             restored = root / "restored"
             restored.mkdir()
             if stream_home:

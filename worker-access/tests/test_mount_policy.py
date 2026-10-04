@@ -6,6 +6,8 @@ from unittest.mock import patch
 
 policy = importlib.machinery.SourceFileLoader(
     "sem_podman", str(Path(__file__).resolve().parents[1] / "sem-podman")).load_module()
+restriction = importlib.machinery.SourceFileLoader(
+    "sem_restriction", str(Path(__file__).resolve().parents[1] / "restrict-filesystem.py")).load_module()
 
 
 class MountPolicyTest(unittest.TestCase):
@@ -44,6 +46,23 @@ class MountPolicyTest(unittest.TestCase):
         self.assertIn("/dev/pts", self.filtered(["create", "-v", "/dev/pts"]))
         with self.assertRaises(ValueError):
             self.filtered(["create", "-v", "other-project:/data"])
+
+    def test_offline_hold_keeps_original_integration_scope_and_volumes(self):
+        data = {"Name": "personal-offline", "Mounts": [
+            {"Destination": "/home/developer", "Source": "/opt/isolated/home"},
+            {"Destination": "/opt/isolated/host_mask", "Source": "/opt/isolated/host_mask"},
+            {"Destination": "/dev/pts", "Name": "a"*64},
+            {"Destination": "/var/log/journal", "Name": "b"*64},
+        ], "Config": {"CreateCommand": ["podman", "--cgroup-manager=cgroupfs", "create",
+            "--name", "personal", "--volume", "/opt/isolated/home:/home/developer",
+            "--volume", "/opt/isolated/host_mask:/opt/isolated/host_mask", "--volume", "/dev/pts",
+            "--volume", "/var/log/journal", "--entrypoint", "/usr/bin/entrypoint", "old-image"]}}
+        with patch.object(restriction.policy, "integration_mounts", return_value=[]) as integrations:
+            result = restriction.prepare(data, "snapshot", "/home/human", "personal")
+        integrations.assert_called_once_with("personal", str(restriction.os.getuid()))
+        self.assertIn("a"*64+":/dev/pts", result)
+        self.assertIn("b"*64+":/var/log/journal", result)
+        self.assertEqual(result[-1], "snapshot")
 
 
 if __name__ == "__main__":

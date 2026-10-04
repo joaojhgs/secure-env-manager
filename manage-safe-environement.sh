@@ -137,13 +137,13 @@ export_bundle() {
     done
     [[ -z "$recipient" || -z "$passphrase_file" ]] || die 'Choose recipient or passphrase file, not both.'
 
-    require_commands podman distrobox gpg tar zstd sha256sum mktemp
+    require_commands podman distrobox gpg tar zstd sha256sum mktemp python3
     [[ $EUID -ne 0 ]] || die "run as the regular rootless Podman user, not root"
     podman container exists "$box" || die "container not found: $box"
     [[ ! -e "$output" ]] || die "output already exists: $output"
     mkdir -p "$(dirname "$output")"
 
-    local staging stamp image source_home was_running=false developer_uid developer_gid owner_pair
+    local staging stamp image source_home source_mask was_running=false developer_uid developer_gid owner_pair
     staging="$(mktemp -d "$(dirname "$output")/.sem-export.XXXXXX")"
     stamp="$(date -u +%Y%m%dT%H%M%SZ)"
     image="localhost/sem-${box}-transfer:${stamp}"
@@ -155,6 +155,10 @@ export_bundle() {
     trap 'exit 130' INT TERM HUP
     source_home="$(podman inspect "$box" --format '{{range .Mounts}}{{if eq .Destination "/home/developer"}}{{.Source}}{{end}}{{end}}')"
     [[ -n "$source_home" && -d "$source_home" ]] || die "could not resolve /home/developer bind mount"
+    # The administrative compatibility home is a second persistent bind, NOT
+    # part of the OCI root filesystem. Preserve it in the recovery package too.
+    source_mask="$(podman inspect "$box" | python3 -c 'import json,sys; d=json.load(sys.stdin)[0]; print(next((m["Source"] for m in d["Mounts"] if m["Type"] == "bind" and m["Destination"].endswith("/host_mask")), ""))')"
+    [[ -z "$source_mask" || ( -d "$source_mask" && ! -L "$source_mask" ) ]] || die 'Invalid administrative home mount'
     owner_pair="$(podman unshare stat -c '%u:%g' "$source_home")"
     developer_uid="${owner_pair%%:*}"
     developer_gid="${owner_pair##*:}"
@@ -171,6 +175,24 @@ export_bundle() {
     # exhaust the very filesystem this backup is meant to protect.
     set -o pipefail
     podman save --format oci-archive "$image" | zstd -T2 -3 -o "$staging/rootfs.oci.tar.zst"
+
+    if [[ -n "$source_mask" ]]; then
+        echo "Archiving persistent administrative compatibility home..."
+        podman unshare tar --acls --xattrs --numeric-owner --sparse -cpf - -C "$source_mask" . |
+            zstd -T2 -3 -o "$staging/administrative-home.tar.zst"
+    fi
+
+    # Preserve persistent named-volume contents as well as their definitions.
+    # /dev/pts is a live kernel terminal filesystem, not persistent user data.
+    podman inspect "$box" | python3 -c 'import json,sys; d=json.load(sys.stdin)[0]; json.dump([m for m in d["Mounts"] if m["Type"] == "volume" and m["Destination"] != "/dev/pts"], sys.stdout)' > "$staging/persistent-volumes.json"
+    local volume_index=0 volume_source
+    while IFS= read -r volume_source; do
+        [[ -d "$volume_source" && ! -L "$volume_source" ]] || die 'Invalid persistent volume source'
+        echo "Archiving persistent volume $volume_index..."
+        podman unshare tar --acls --xattrs --numeric-owner --sparse -cpf - -C "$volume_source" . |
+            zstd -T2 -3 -o "$staging/persistent-volume-$volume_index.tar.zst"
+        volume_index=$((volume_index + 1))
+    done < <(python3 -c 'import json,sys; [print(m["Source"]) for m in json.load(open(sys.argv[1]))]' "$staging/persistent-volumes.json")
 
     echo "Archiving developer home with container-relative ownership..."
     local -a tar_excludes=()
@@ -195,13 +217,25 @@ HOME_DESTINATION=/home/developer
 DEVELOPER_UID=$developer_uid
 DEVELOPER_GID=$developer_gid
 SOURCE_HOME=$source_home
+SOURCE_ADMINISTRATIVE_HOME=$source_mask
 EOF
-    local -a bundle_members=(manifest.env SHA256SUMS rootfs.oci.tar.zst container-inspect.json home-exclusions.txt)
+    local -a bundle_members=(manifest.env SHA256SUMS rootfs.oci.tar.zst container-inspect.json home-exclusions.txt persistent-volumes.json)
+    [[ -z "$source_mask" ]] || bundle_members+=(administrative-home.tar.zst)
+    local volume_count=$volume_index
+    for ((volume_index=0; volume_index<volume_count; volume_index++)); do
+        bundle_members+=("persistent-volume-$volume_index.tar.zst")
+    done
+    local -a checked_members=()
+    local member
+    for member in "${bundle_members[@]}"; do
+        [[ "$member" == SHA256SUMS ]] || checked_members+=("$member")
+    done
     if [[ "$stream_home" == true ]]; then
-        (cd "$staging" && sha256sum rootfs.oci.tar.zst container-inspect.json manifest.env home-exclusions.txt > SHA256SUMS)
+        (cd "$staging" && sha256sum "${checked_members[@]}" > SHA256SUMS)
     else
         bundle_members+=(developer-home.tar.zst)
-        (cd "$staging" && sha256sum rootfs.oci.tar.zst developer-home.tar.zst container-inspect.json manifest.env home-exclusions.txt > SHA256SUMS)
+        checked_members+=(developer-home.tar.zst)
+        (cd "$staging" && sha256sum "${checked_members[@]}" > SHA256SUMS)
     fi
     emit_bundle() {
         if [[ "$stream_home" == true ]]; then
@@ -245,7 +279,7 @@ EOF
 import_bundle() {
     [[ $# -ge 2 && $# -le 3 ]] || { usage >&2; exit 2; }
     local bundle="$1" storage_root="${2%/}" requested_name="${3:-}"
-    require_commands podman gpg tar zstd sha256sum mktemp findmnt sudo
+    require_commands podman gpg tar zstd sha256sum mktemp findmnt sudo python3
     [[ $EUID -ne 0 ]] || die "run as the regular rootless Podman user, not root"
     [[ -f "$bundle" ]] || die "bundle not found: $bundle"
     if [[ -f "$bundle.sha256" ]]; then
@@ -269,8 +303,11 @@ import_bundle() {
     # not confuse that with container-relative home ownership; normalize ONLY
     # known staging metadata so the destination Podman owner can read it.
     local metadata
-    for metadata in manifest.env SHA256SUMS container-inspect.json home-exclusions.txt rootfs.oci.tar rootfs.oci.tar.zst developer-home.tar.zst; do
+    for metadata in manifest.env SHA256SUMS container-inspect.json home-exclusions.txt rootfs.oci.tar rootfs.oci.tar.zst developer-home.tar.zst administrative-home.tar.zst persistent-volumes.json; do
         [[ ! -f "$staging/$metadata" || -L "$staging/$metadata" ]] || podman unshare chown 0:0 "$staging/$metadata"
+    done
+    for metadata in "$staging"/persistent-volume-[0-9]*.tar.zst; do
+        [[ ! -f "$metadata" || -L "$metadata" ]] || podman unshare chown 0:0 "$metadata"
     done
     [[ -f "$staging/manifest.env" && -f "$staging/SHA256SUMS" ]] || die "invalid transfer bundle"
     (cd "$staging" && sha256sum -c SHA256SUMS)
@@ -307,6 +344,26 @@ import_bundle() {
             podman unshare tar --acls --xattrs --same-owner --sparse -xpf - -C "$dest_home"
     fi
     podman unshare chown "$developer_uid:$developer_gid" "$dest_home"
+    if [[ -f "$staging/administrative-home.tar.zst" ]]; then
+        echo "Restoring administrative compatibility home..."
+        zstd -dc "$staging/administrative-home.tar.zst" |
+            podman unshare tar --acls --xattrs --same-owner --sparse -xpf - -C "$dest_mask"
+    fi
+    if [[ -f "$staging/persistent-volumes.json" ]]; then
+        echo "Restoring persistent volume data (not automatically attached)..."
+        local volume_destination volume_index=0
+        mkdir -m 0700 "$env_root/imported-volumes"
+        while IFS= read -r volume_destination; do
+            local volume_archive="$staging/persistent-volume-$volume_index.tar.zst"
+            [[ -f "$volume_archive" ]] || die 'Missing persistent volume archive'
+            podman unshare chown 0:0 "$volume_archive"
+            mkdir -m 0700 "$env_root/imported-volumes/$volume_index"
+            zstd -dc "$volume_archive" |
+                podman unshare tar --acls --xattrs --same-owner --sparse -xpf - -C "$env_root/imported-volumes/$volume_index"
+            volume_index=$((volume_index + 1))
+        done < <(python3 -c 'import json,sys; [print(m["Destination"]) for m in json.load(open(sys.argv[1]))]' "$staging/persistent-volumes.json")
+        install -m 0600 "$staging/persistent-volumes.json" "$env_root/imported-volumes/mount-definitions.json"
+    fi
 
     echo "Loading OCI image..."
     if [[ "$bundle_version" == 1 ]]; then
@@ -1933,6 +1990,9 @@ EOF
     distrobox enter "$BOX_NAME" -- sudo -u "$INTERNAL_USER" /bin/bash /home/$INTERNAL_USER/user.sh
 
     install_bridge
+    if [[ -d /dev/dri ]]; then
+        sudo bash "$SCRIPT_DIR/worker-access/enable-gpu-access.sh" "$BOX_NAME" "$HOST_USER"
+    fi
     setup_video_permissions
     setup_default_input_devices
     

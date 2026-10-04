@@ -28,7 +28,7 @@ def inspect(box):
     return json.loads(subprocess.check_output(["podman", "inspect", box]))[0]
 
 
-def prepare(data, image, host_home):
+def prepare(data, image, host_home, target_name=None):
     mounts = {m["Destination"]: m for m in data["Mounts"]}
     scoped_home = mounts["/home/developer"]["Source"]
     mask = next(m["Source"] for m in data["Mounts"] if m["Destination"].endswith("/host_mask"))
@@ -42,7 +42,7 @@ def prepare(data, image, host_home):
         for i, arg in enumerate(args[:entry]):
             if arg == "--volume" and args[i + 1] == destination:
                 args[i + 1] = f'{m["Name"]}:{destination}'
-    return policy.filter_create(args, host_home, scoped_home, mask, data["Name"], str(os.getuid()))
+    return policy.filter_create(args, host_home, scoped_home, mask, target_name or data["Name"], str(os.getuid()))
 
 
 def main():
@@ -50,9 +50,13 @@ def main():
     parser.add_argument("box")
     parser.add_argument("backup", type=Path)
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--target-name", help="Return an offline-held source to this original environment name")
     opts = parser.parse_args()
     if os.getuid() == 0:
         parser.error("Run as the regular rootless Podman owner")
+    target = opts.target_name or opts.box
+    if target != opts.box and subprocess.run(["podman", "container", "exists", target], check=False).returncode == 0:
+        parser.error("Target container name already exists; original stays untouched")
     backup = opts.backup.resolve(strict=True)
     if backup.stat().st_mode & 0o077 or backup.stat().st_uid != os.getuid():
         parser.error("Backup must be owned by you and inaccessible to other users")
@@ -66,7 +70,7 @@ def main():
     if old["State"]["Running"]:
         parser.error("Original must be stopped by a successful consistent export")
     try:
-        args = prepare(old, image, os.path.expanduser("~"))
+        args = prepare(old, image, os.path.expanduser("~"), target)
     except BaseException:
         if opts.apply:
             run("podman", "start", opts.box, stdout=subprocess.DEVNULL)
@@ -76,8 +80,8 @@ def main():
         print("PASS: verified backup/snapshot and prepared mount-only replacement. Use --apply for cutover.")
         return 0
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    rollback = f"{opts.box}-hostfs-rollback-{stamp}"
-    stage = f"{opts.box}-hostfs-stage-{stamp}"
+    rollback = f"{target}-hostfs-rollback-{stamp}"
+    stage = f"{target}-hostfs-stage-{stamp}"
     name_index = args.index("--name")
     args[name_index + 1] = stage
     swapped = False
@@ -92,25 +96,25 @@ def main():
                 raise RuntimeError(f"Refusing unexpected change to hardware/privilege setting: {key}")
         run(sys.executable, str(HERE / "verify-filesystem.py"), stage, os.path.expanduser("~"))
         run("podman", "rename", opts.box, rollback)
-        run("podman", "rename", stage, opts.box)
+        run("podman", "rename", stage, target)
         swapped = True
-        run("podman", "start", opts.box, stdout=subprocess.DEVNULL)
+        run("podman", "start", target, stdout=subprocess.DEVNULL)
         ready = False
         for _ in range(60):
-            result = subprocess.run(["podman", "exec", opts.box, "test", "-f", "/run/.containerenv"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            result = subprocess.run(["podman", "exec", target, "test", "-f", "/run/.containerenv"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if result.returncode == 0:
                 ready = True
                 break
             time.sleep(1)
         if not ready:
             raise RuntimeError("Replacement did not start")
-        run(sys.executable, str(HERE / "verify-filesystem.py"), opts.box, os.path.expanduser("~"))
-        print(f"CUTOVER: {opts.box}; stopped rollback container: {rollback}")
+        run(sys.executable, str(HERE / "verify-filesystem.py"), target, os.path.expanduser("~"))
+        print(f"CUTOVER: {target}; stopped rollback container: {rollback}")
         print("Installed system, isolated home, original hardware privileges and private builders retained.")
     except BaseException:
         if swapped:
-            subprocess.run(["podman", "stop", "--time", "10", opts.box], check=False)
-            run("podman", "rename", opts.box, stage)
+            subprocess.run(["podman", "stop", "--time", "10", target], check=False)
+            run("podman", "rename", target, stage)
             run("podman", "rename", rollback, opts.box)
         elif subprocess.run(["podman", "container", "exists", rollback], check=False).returncode == 0:
             run("podman", "rename", rollback, opts.box)
