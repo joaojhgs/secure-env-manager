@@ -123,6 +123,8 @@ esac
                     self.assertNotIn("./cache.bin", tar.getnames())
                     tar.extractall(restored, filter="data")
             log = (root / "calls").read_text()
+            self.assertIn('unshare bash -c [[ -d "$1" && ! -L "$1" ]] _ ' + str(volume), log)
+            self.assertLess(log.index('unshare bash -c'), log.index('distrobox stop'))
             self.assertIn("distrobox stop fixture --yes", log)
             self.assertNotIn("start fixture", log)
             self.assertNotIn("image rm", log)

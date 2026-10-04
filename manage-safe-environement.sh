@@ -163,6 +163,15 @@ export_bundle() {
     developer_uid="${owner_pair%%:*}"
     developer_gid="${owner_pair##*:}"
 
+    # Validate persistent storage in the rootless user namespace BEFORE downtime.
+    # Guest-root volumes can have a mapped UID and a 0700 parent; the ordinary
+    # host user cannot stat those even though Podman can safely archive them.
+    podman inspect "$box" | python3 -c 'import json,sys; d=json.load(sys.stdin)[0]; json.dump([m for m in d["Mounts"] if m["Type"] == "volume" and m["Destination"] != "/dev/pts"], sys.stdout)' > "$staging/persistent-volumes.json"
+    local volume_source
+    while IFS= read -r volume_source; do
+        podman unshare bash -c '[[ -d "$1" && ! -L "$1" ]]' _ "$volume_source" || die 'Invalid persistent volume source'
+    done < <(python3 -c 'import json,sys; [print(m["Source"]) for m in json.load(open(sys.argv[1]))]' "$staging/persistent-volumes.json")
+
     if [[ "$(podman inspect "$box" --format '{{.State.Running}}')" == true ]]; then
         was_running=true
         SEM_CLEANUP_RESTART=true
@@ -170,11 +179,11 @@ export_bundle() {
         distrobox stop "$box" --yes
     fi
     echo "Creating OCI image snapshot..."
-    podman commit "$box" "$image" >/dev/null
+    TMPDIR="$staging" podman commit "$box" "$image" >/dev/null
     # Compress the OCI archive too: staging an uncompressed installed system can
     # exhaust the very filesystem this backup is meant to protect.
     set -o pipefail
-    podman save --format oci-archive "$image" | zstd -T2 -3 -o "$staging/rootfs.oci.tar.zst"
+    TMPDIR="$staging" podman save --format oci-archive "$image" | zstd -T2 -3 -o "$staging/rootfs.oci.tar.zst"
 
     if [[ -n "$source_mask" ]]; then
         echo "Archiving persistent administrative compatibility home..."
@@ -184,10 +193,9 @@ export_bundle() {
 
     # Preserve persistent named-volume contents as well as their definitions.
     # /dev/pts is a live kernel terminal filesystem, not persistent user data.
-    podman inspect "$box" | python3 -c 'import json,sys; d=json.load(sys.stdin)[0]; json.dump([m for m in d["Mounts"] if m["Type"] == "volume" and m["Destination"] != "/dev/pts"], sys.stdout)' > "$staging/persistent-volumes.json"
-    local volume_index=0 volume_source
+    local volume_index=0
     while IFS= read -r volume_source; do
-        [[ -d "$volume_source" && ! -L "$volume_source" ]] || die 'Invalid persistent volume source'
+        podman unshare bash -c '[[ -d "$1" && ! -L "$1" ]]' _ "$volume_source" || die 'Invalid persistent volume source'
         echo "Archiving persistent volume $volume_index..."
         podman unshare tar --acls --xattrs --numeric-owner --sparse -cpf - -C "$volume_source" . |
             zstd -T2 -3 -o "$staging/persistent-volume-$volume_index.tar.zst"
