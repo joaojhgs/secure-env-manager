@@ -42,7 +42,14 @@ def prepare(data, image, host_home, target_name=None):
         for i, arg in enumerate(args[:entry]):
             if arg == "--volume" and args[i + 1] == destination:
                 args[i + 1] = f'{m["Name"]}:{destination}'
-    return policy.filter_create(args, host_home, scoped_home, mask, target_name or data["Name"], str(os.getuid()))
+    args = policy.filter_create(args, host_home, scoped_home, mask, target_name or data["Name"], str(os.getuid()))
+    # This is an initialized snapshot with an existing compatibility home, not
+    # a new user's empty home. Distrobox 1.7's DISTROBOX_HOST_HOME/skel branch
+    # unconditionally chowns that entire tree at every startup. Disable only
+    # that first-home import branch; keep normal init, devices and integration.
+    entry = args.index("--entrypoint")
+    args[entry:entry] = ["--env", "DISTROBOX_HOST_HOME="]
+    return args
 
 
 def main():
@@ -100,14 +107,24 @@ def main():
         swapped = True
         run("podman", "start", target, stdout=subprocess.DEVNULL)
         ready = False
+        entry_command = original[original.index("--entrypoint") + 3:]
+        initful = "--init" in entry_command and entry_command[entry_command.index("--init") + 1] == "1"
         for _ in range(60):
-            result = subprocess.run(["podman", "exec", target, "test", "-f", "/run/.containerenv"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # .containerenv exists before Distrobox has finished initializing.
+            # An initful snapshot is ready only after its actual init takes PID1.
+            probe = ["sh", "-c", "test \"$(cat /proc/1/comm)\" = systemd"] if initful else ["test", "-f", "/run/.containerenv"]
+            result = subprocess.run(["podman", "exec", target, *probe], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if result.returncode == 0:
                 ready = True
                 break
             time.sleep(1)
         if not ready:
             raise RuntimeError("Replacement did not start")
+        if Path(f"/run/user/{os.getuid()}/pulse/native").exists():
+            with (HERE / "configure-pulse-client.py").open("rb") as configuration:
+                run("podman", "exec", "-i", "--user", "0", target,
+                    "runuser", "-l", "developer", "-c", f"python3 - {os.getuid()}",
+                    stdin=configuration)
         run(sys.executable, str(HERE / "verify-filesystem.py"), target, os.path.expanduser("~"))
         print(f"CUTOVER: {target}; stopped rollback container: {rollback}")
         print("Installed system, isolated home, original hardware privileges and private builders retained.")

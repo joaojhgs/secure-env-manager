@@ -62,6 +62,8 @@ class MountPolicyTest(unittest.TestCase):
         integrations.assert_called_once_with("personal", str(restriction.os.getuid()))
         self.assertIn("a"*64+":/dev/pts", result)
         self.assertIn("b"*64+":/var/log/journal", result)
+        self.assertIn("DISTROBOX_HOST_HOME=", result)
+        self.assertLess(result.index("DISTROBOX_HOST_HOME="), result.index("--entrypoint"))
         self.assertEqual(result[-1], "snapshot")
 
 

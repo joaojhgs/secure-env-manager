@@ -1370,6 +1370,10 @@ function install_bridge() {
             chown developer:developer /home/developer/.config/pulse/cookie
         ' < "$HOST_HOME/.config/pulse/cookie"
     fi
+    if [[ -S "/run/user/$(id -u)/pulse/native" ]]; then
+        podman exec -i --user 0 "$BOX_NAME" runuser -l developer -c "python3 - $(id -u)" \
+            < "$SCRIPT_DIR/worker-access/configure-pulse-client.py" || return $?
+    fi
     
     cat << 'EOF' | distrobox enter "$BOX_NAME" -- sudo tee /usr/local/bin/run-as-dev > /dev/null
 #!/bin/bash
